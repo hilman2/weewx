@@ -928,3 +928,30 @@ def test_a_logger_record_is_not_overwritten_by_a_late_packet(tmp_path):
         assert station.record(START + INTERVAL)['outTemp'] == 41.0
     finally:
         station.close()
+
+
+def test_hardware_that_cannot_deliver_still_gets_records_put_right(tmp_path):
+    """The case that bit on a live station.
+
+    record_generation defaults to 'hardware' in every weewx.conf, and plenty of
+    stations are left that way while their driver has no archive to offer. WeeWX
+    falls back to software silently. A late packet then has to put the record right
+    like anywhere else, rather than be written a second time and refused.
+    """
+    config = make_config(tmp_path, record_generation='hardware')
+    station = Station(config)     # the plain console: NotImplementedError
+    try:
+        station.feed(*[packet(START + n * 20, outTemp=10.0, rain=0.1)
+                       for n in range(1, 10)])
+        station.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
+        assert station.record(START + INTERVAL)['rain'] == pytest.approx(0.9)
+        assert station.archive.hardware_archive is False    # noticed and remembered
+
+        station.feed(packet(START + 100, rain=0.5))
+        station.feed(packet(START + 2 * INTERVAL + 10),
+                     packet(START + 2 * INTERVAL + 200))
+
+        assert station.record(START + INTERVAL)['rain'] == pytest.approx(1.4)
+        assert station.day_summary('rain', START)['sum'] == pytest.approx(1.4)
+    finally:
+        station.close()

@@ -622,6 +622,11 @@ class StdArchive(StdService):
         # Which field of a packet says where it came from. Recorded for diagnosis when
         # several sources report to one WeeWX; nothing is decided by it.
         self.source_field = archive_dict.get('source_field', 'station')
+        # Whether the console keeps an archive of its own. Taken from the
+        # configuration, and corrected the first time the console says it does not.
+        # Plenty of hardware is configured for it and cannot do it: a station may have
+        # a logger and still not offer it over the protocol it uploads with.
+        self.hardware_archive = (self.record_generation == 'hardware')
         try:
             self.store = weewx.loopstore.LoopStore.open_with_config(
                 config_dict,
@@ -790,8 +795,11 @@ class StdArchive(StdService):
         if self.old_accumulator is None:
             return
         try:
-            existing = None if self.record_generation == 'hardware' \
-                else self._dbmanager().getRecord(stop)
+            existing = self._dbmanager().getRecord(stop)
+            if existing is not None and self.hardware_archive:
+                # The console keeps its own archive and is the authority for its own
+                # periods. A late packet does not overrule what it measured.
+                return
             if existing is not None:
                 # A record for this time is already in the database. Only a packet
                 # that arrived after it was written can have brought us back here.
@@ -818,6 +826,10 @@ class StdArchive(StdService):
                 try:
                     self._catchup(self.engine.console.genArchiveRecords)
                 except NotImplementedError:
+                    # No archive on the console after all. Remember that, so a
+                    # record already there is put right from the packets rather
+                    # than written a second time.
+                    self.hardware_archive = False
                     self._software_catchup()
             else:
                 raise ValueError("Unknown station record generation value %s"
