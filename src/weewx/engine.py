@@ -789,22 +789,22 @@ class StdArchive(StdService):
         self.old_accumulator = self._accumulator_for(start, stop)
         if self.old_accumulator is None:
             return
-        if not self._held_whole(start):
-            # Only part of this period is still held; the rest has been trimmed away.
-            # A record built from what survived would be worse than the one already
-            # there, and where there is none, worse than nothing.
-            log.warning("Archive period %s has packets but is no longer held whole. "
-                        "Leaving it alone. Raise 'archive_days', or use 'weectl "
-                        "import --update' for data that old.",
-                        weeutil.weeutil.timestamp_to_string(stop))
-            self.old_accumulator = None
-            return
         try:
             existing = None if self.record_generation == 'hardware' \
                 else self._dbmanager().getRecord(stop)
             if existing is not None:
                 # A record for this time is already in the database. Only a packet
                 # that arrived after it was written can have brought us back here.
+                if not self._held_whole(start):
+                    # And only part of the period is still held, the rest having been
+                    # trimmed away. Working it out from what survived would replace a
+                    # record made from a hundred readings with one made from a handful.
+                    log.warning("Archive record %s has late packets, but the rest of "
+                                "its period is no longer held. Leaving it alone. "
+                                "Raise 'archive_days', or use 'weectl import "
+                                "--update' for data that old.",
+                                weeutil.weeutil.timestamp_to_string(stop))
+                    return
                 self._revise(existing, stop)
                 return
 
