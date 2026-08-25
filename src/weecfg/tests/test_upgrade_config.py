@@ -177,6 +177,30 @@ class TestUpgrade:
 
         _check_against_expected(config_dict, 'expected/weewx43_expected.conf')
 
+    def test_upgrade_v55(self):
+        """The loop store has to reach an installation that predates it"""
+
+        config_dict = configobj.ConfigObj('weewx42.conf', encoding='utf-8')
+
+        weecfg.update_config.update_to_v55(config_dict)
+
+        services = config_dict['Engine']['Services']['archive_services']
+        assert 'weewx.loopstore.StdLoopStore' in services
+        assert 'weewx.engine.StdArchive' in services
+        assert config_dict['DataBindings']['loop_binding']['table_name'] == 'packets'
+        assert config_dict['Databases']['loop_sqlite']['database_type'] == 'SQLite'
+
+    def test_upgrade_v55_twice(self):
+        """Upgrading an already upgraded file must not double anything up"""
+
+        config_dict = configobj.ConfigObj('weewx42.conf', encoding='utf-8')
+
+        weecfg.update_config.update_to_v55(config_dict)
+        weecfg.update_config.update_to_v55(config_dict)
+
+        services = config_dict['Engine']['Services']['archive_services']
+        assert services.count('weewx.loopstore.StdLoopStore') == 1
+
     def test_merge(self):
         """Test an upgrade against a typical user's configuration file"""
 

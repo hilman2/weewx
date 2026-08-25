@@ -3,6 +3,11 @@ WeeWX change history
 
 ### 5.5.0 6-Aug-2026
 
+Keep LOOP packets for a few days, so that an archive record can be worked out
+again from them. A reading that arrives after its archive period has ended now
+reaches the record it belongs to, and a period lost to a restart is filled in.
+See `[StdLoopStore]` in the reference guide.
+
 Added the ability for services to bind to a `SHUTDOWN` event. This allows
 services to be notified when `weewxd` is being shutdown. 
 [PR #1106](https://github.com/weewx/weewx/issues/1106). Thanks to user
