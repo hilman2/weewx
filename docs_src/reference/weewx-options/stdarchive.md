@@ -15,6 +15,12 @@ it: the record has been through that once already, and raising it a second time 
 send the same reading to Wunderground and the rest twice. Reports pick the corrected
 value up on their next run. Uploads do not pick it up at all.
 
+A console that keeps its own archive is the authority for its own periods, and its
+records are left as they are. That is decided by what the console can actually do, not
+by `record_generation`: a station may have a logger and still not offer it over the
+protocol it uploads with, in which case WeeWX falls back to software generation and
+the packets have the last word after all.
+
 The packets are kept for `retain_days` in the table, then for `archive_days` as one
 gzipped NDJSON file per day, which is about a thirtieth of the size. A record can be
 worked out again for as long as the whole of its period is still held in one place or
