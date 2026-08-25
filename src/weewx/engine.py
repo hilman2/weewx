@@ -675,6 +675,9 @@ class StdArchive(StdService):
         # Do a catch-up on any data still on the station, but not yet put in the database.
         if self.no_catchup:
             log.debug("No catchup specified.")
+            # The catchup below is also where we find out whether the console has an
+            # archive at all. Without it, ask in a way that changes nothing.
+            self._settle_hardware_archive()
         else:
             # Not all consoles can do a hardware catchup, so be prepared to catch the exception:
             try:
@@ -768,6 +771,28 @@ class StdArchive(StdService):
 
         # Set the time of the next break loop:
         self.end_archive_delay_ts = self.end_archive_period_ts + self.archive_delay
+
+    def _settle_hardware_archive(self):
+        """Find out whether the console has an archive of its own, without using it.
+
+        Asking for records since the newest one in the database yields nothing on a
+        console that is up to date, and NotImplementedError on one that has no archive.
+        Either answer settles it; neither writes anything.
+        """
+        if not self.hardware_archive:
+            return
+        try:
+            generator = self.engine.console.genArchiveRecords(self._dbmanager()
+                                                              .lastGoodStamp())
+            next(iter(generator), None)
+        except NotImplementedError:
+            log.info("The console has no archive of its own, so records are worked "
+                     "out from the LOOP packets.")
+            self.hardware_archive = False
+        except Exception as e:                                       # noqa: BLE001
+            # Anything else means the console does have an archive and simply could
+            # not be read just now. Leave the flag alone.
+            log.debug("Could not ask the console for records: %s", e)
 
     def _pick_up_where_we_left_off(self):
         """Queue up the periods whose packets have not been through post_loop yet."""

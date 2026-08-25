@@ -980,3 +980,24 @@ def test_a_console_with_no_archive_is_noticed_at_startup(tmp_path):
         assert station.record(START + INTERVAL)['extraTemp3'] == 41.2
     finally:
         station.close()
+
+
+def test_no_catchup_does_not_hide_a_missing_console_archive(tmp_path):
+    """The startup catchup is also the test, so switching it off must not blind us."""
+    config = make_config(tmp_path, record_generation='hardware', no_catchup='true')
+    station = Station(config)
+    try:
+        assert station.archive.hardware_archive is False
+    finally:
+        station.close()
+
+
+def test_a_logger_keeps_its_authority_with_no_catchup(tmp_path):
+    """And a console that does have one is still believed."""
+    console = LoggingConsole([hardware_record(START + INTERVAL, outTemp=41.0)])
+    config = make_config(tmp_path, record_generation='hardware', no_catchup='true')
+    station = Station(config, console=console)
+    try:
+        assert station.archive.hardware_archive is True
+    finally:
+        station.close()
