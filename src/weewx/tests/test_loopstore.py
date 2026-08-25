@@ -54,12 +54,32 @@ class FakeConsole:
         raise NotImplementedError("No hardware archive")
 
 
+class LoggingConsole(FakeConsole):
+    """A console that keeps its own archive, the way a Vantage does."""
+
+    def __init__(self, records):
+        self.records = list(records)
+        self.catchups = 0
+
+    def genArchiveRecords(self, since_ts):
+        self.catchups += 1
+        for record in self.records:
+            if since_ts is None or record['dateTime'] > since_ts:
+                yield dict(record)
+
+    def genStartupRecords(self, since_ts):
+        # Nothing to catch up on at startup: the logger has already been read. What
+        # it produces from here on arrives through genArchiveRecords, alongside the
+        # LOOP packets of the same period.
+        return iter([])
+
+
 class FakeEngine:
     """Enough engine to dispatch events, with a real database binder."""
 
-    def __init__(self, config_dict):
+    def __init__(self, config_dict, console=None):
         self.callbacks = {}
-        self.console = FakeConsole()
+        self.console = console if console is not None else FakeConsole()
         self.db_binder = weewx.manager.DBBinder(config_dict)
 
     def bind(self, event_type, callback):
@@ -115,9 +135,9 @@ def packet(timestamp, **values):
 class Station:
     """One StdArchive, fed the way StdEngine.run() feeds it."""
 
-    def __init__(self, config_dict):
+    def __init__(self, config_dict, console=None):
         self.config_dict = config_dict
-        self.engine = FakeEngine(config_dict)
+        self.engine = FakeEngine(config_dict, console)
         self.archive = weewx.engine.StdArchive(self.engine, config_dict)
         self.engine.dispatchEvent(weewx.Event(weewx.STARTUP))
         self.engine.dispatchEvent(weewx.Event(weewx.PRE_LOOP))
@@ -829,3 +849,82 @@ def test_an_ingest_table_that_cannot_be_opened_says_so(tmp_path):
         Station(config)
 
     assert 'ingest table' in str(caught.value)
+
+
+# ==============================================================================
+#                      hardware that keeps its own archive
+# ==============================================================================
+
+def hardware_record(ts, **values):
+    r = {'dateTime': int(ts), 'usUnits': weewx.US, 'interval': INTERVAL / 60,
+         'outTemp': 55.5}
+    r.update(values)
+    return r
+
+
+def test_a_logger_record_is_used_as_it_stands(tmp_path):
+    """Where the console keeps its own archive, its record is the record.
+
+    The packets are still kept, but they do not overrule what the logger says. It
+    measured over the whole period; the packets are only what reached us.
+    """
+    console = LoggingConsole([hardware_record(START + INTERVAL, outTemp=41.0)])
+    config = make_config(tmp_path, record_generation='hardware')
+    station = Station(config, console=console)
+    try:
+        station.feed(*[packet(START + n * 20, outTemp=99.0) for n in range(1, 10)])
+        station.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
+
+        written = station.record(START + INTERVAL)
+        assert written['outTemp'] == 41.0        # the logger's figure, not 99.0
+        assert console.catchups >= 1
+    finally:
+        station.close()
+
+
+def test_a_logger_record_is_augmented_from_the_packets(tmp_path):
+    """The logger has fewer fields than the packets do. The rest comes from them."""
+    console = LoggingConsole([hardware_record(START + INTERVAL)])
+    config = make_config(tmp_path, record_generation='hardware')
+    station = Station(config, console=console)
+    try:
+        station.feed(*[packet(START + n * 20, extraTemp3=12.5) for n in range(1, 10)])
+        station.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
+
+        written = station.record(START + INTERVAL)
+        assert written['outTemp'] == 55.5        # from the logger
+        assert written['extraTemp3'] == 12.5     # from the packets
+    finally:
+        station.close()
+
+
+def test_a_console_with_no_archive_falls_back_to_the_packets(tmp_path):
+    """NotImplementedError means work it out from the packets after all."""
+    config = make_config(tmp_path, record_generation='hardware')
+    station = Station(config)
+    try:
+        station.feed(*[packet(START + n * 20, outTemp=10.0) for n in range(1, 10)])
+        station.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
+
+        assert station.record(START + INTERVAL)['outTemp'] == 10.0
+    finally:
+        station.close()
+
+
+def test_a_logger_record_is_not_overwritten_by_a_late_packet(tmp_path):
+    """The logger is the authority for its own period, late packets or not."""
+    console = LoggingConsole([hardware_record(START + INTERVAL, outTemp=41.0)])
+    config = make_config(tmp_path, record_generation='hardware')
+    station = Station(config, console=console)
+    try:
+        station.feed(*[packet(START + n * 20) for n in range(1, 10)])
+        station.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
+        assert station.record(START + INTERVAL)['outTemp'] == 41.0
+
+        station.feed(packet(START + 100, outTemp=-40.0))
+        station.feed(packet(START + 2 * INTERVAL + 10),
+                     packet(START + 2 * INTERVAL + 200))
+
+        assert station.record(START + INTERVAL)['outTemp'] == 41.0
+    finally:
+        station.close()
