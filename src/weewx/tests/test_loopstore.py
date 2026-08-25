@@ -12,6 +12,7 @@ by opening the database afterwards.
 """
 
 import datetime
+import json
 import os
 import time
 
@@ -552,6 +553,237 @@ def test_the_daily_summary_keeps_the_loop_highs_after_a_rebuild(station):
     averages = [r['outTemp'] for r in station.records() if r['outTemp'] is not None]
     assert min(averages) > after['min']
     assert max(averages) <= after['max']
+
+
+def test_a_period_older_than_the_retention_is_left_alone(station, caplog):
+    """The one that would destroy data.
+
+    A packet from two months ago arrives. Its period is long past, and the store no
+    longer holds the rest of it. Working the record out again would replace a hundred
+    readings with the one that turned up late.
+    """
+    import logging
+
+    station.feed(*[packet(START + n * 20, outTemp=10.0, rain=0.1)
+                   for n in range(1, 15)])
+    station.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
+    intact = dict(station.record(START + INTERVAL))
+
+    # Two months back, well outside the seven days of retention.
+    long_ago = START - 60 * 86400
+    with weedb.Transaction(station.manager.connection) as cursor:
+        cursor.execute("INSERT INTO archive (dateTime, usUnits, interval, outTemp, "
+                       "rain) VALUES (?, ?, ?, ?, ?)",
+                       (long_ago + INTERVAL, weewx.US, INTERVAL / 60, 5.0, 3.0))
+    station.manager._sync()
+
+    with caplog.at_level(logging.WARNING):
+        station.store_service.store.add(packet(long_ago + 100, outTemp=99.0, rain=0.0))
+        station.store_service.post_loop(None)
+
+    old_record = station.record(long_ago + INTERVAL)
+    assert old_record['outTemp'] == 5.0        # untouched
+    assert old_record['rain'] == 3.0           # the month's rain is still there
+    assert 'archive_days' in caplog.text
+    assert 'weectl import' in caplog.text
+    # And the recent record is unaffected by all of this.
+    assert station.record(START + INTERVAL)['outTemp'] == intact['outTemp']
+
+
+def test_raising_the_retention_lets_older_periods_through(tmp_path):
+    """Somebody whose source lags by weeks sets the retention to cover it."""
+    config = make_config(tmp_path, retain_days=120)
+    station = Station(config)
+    try:
+        long_ago = START - 60 * 86400
+        station.store_service.store.add(packet(long_ago + 100, outTemp=7.0))
+        station.store_service.store.add(packet(long_ago + 200, outTemp=9.0))
+        station.store_service.store.add(packet(START + 10))
+        station.store_service.post_loop(None)
+
+        written = station.record(long_ago + INTERVAL)
+        assert written is not None
+        assert written['outTemp'] == pytest.approx(8.0)
+    finally:
+        station.close()
+
+
+def test_the_mark_survives_a_restart(config):
+    """What has been dealt with is not gone over again after a restart."""
+    first = Station(config)
+    first.feed(*[packet(START + n * 20, outTemp=10.0) for n in range(1, 10)])
+    first.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
+    mark = first.store_service.store.get_metadata(weewx.loopstore.APPLIED_THROUGH)
+    first.close()
+
+    assert mark is not None and int(mark) > 0
+
+    second = Station(config)
+    try:
+        # Nothing new has arrived, so the startup pass has nothing to do.
+        assert second.store_service._catch_up() == 0
+    finally:
+        second.close()
+
+
+def test_a_packet_that_arrives_while_stopped_is_dealt_with_on_the_way_up(config):
+    """No mark for it, so the next start finds it."""
+    first = Station(config)
+    first.feed(*[packet(START + n * 20, outTemp=10.0) for n in range(1, 10)])
+    first.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
+    assert first.record(START + INTERVAL)['extraTemp3'] is None
+    # Straight into the store, as a driver would have done just before the stop.
+    first.store_service.store.add(packet(START + 100, extraTemp3=41.2))
+    first.close()
+
+    second = Station(config)
+    found = second.record(START + INTERVAL)['extraTemp3']
+    second.close()
+
+    assert found == 41.2
+
+
+# ==============================================================================
+#                       the days that leave the database
+# ==============================================================================
+
+def a_store(tmp_path, name='days.sdb', **kw):
+    return weewx.loopstore.LoopStore(
+        {'database_name': name, 'database_type': 'SQLite',
+         'driver': 'weedb.sqlite', 'SQLITE_ROOT': str(tmp_path)},
+        archive_dir=str(tmp_path / 'packets'), **kw)
+
+
+def test_trimming_writes_the_day_out_before_dropping_it(tmp_path):
+    """Leaving the database must not be the same as being thrown away."""
+    store = a_store(tmp_path)
+    long_ago = START - 40 * 86400
+    for n in range(1, 6):
+        store.add(packet(long_ago + n * 20, outTemp=float(n)))
+    store.add(packet(START))
+
+    moved = store.trim(START - 86400)
+    day_file = store.day_path(weeutil.weeutil.startOfArchiveDay(long_ago))
+    kept = list(store.packets(long_ago, long_ago + INTERVAL))
+    store.close()
+
+    assert moved == 5
+    assert os.path.exists(day_file)
+    assert [p['outTemp'] for p in kept] == [1.0, 2.0, 3.0, 4.0, 5.0]
+
+
+def test_the_day_file_is_plain_gzipped_ndjson(tmp_path):
+    """One JSON object per line, readable with zcat and anything else."""
+    import gzip
+
+    store = a_store(tmp_path)
+    long_ago = START - 40 * 86400
+    store.add(packet(long_ago + 10, outTemp=12.5))
+    store.add(packet(long_ago + 20, outTemp=13.5))
+    store.trim(START - 86400)
+    path = store.day_path(weeutil.weeutil.startOfArchiveDay(long_ago))
+    store.close()
+
+    with gzip.open(path, 'rt', encoding='utf-8') as fd:
+        lines = [line for line in fd if line.strip()]
+    assert len(lines) == 2
+    assert [json.loads(line)['outTemp'] for line in lines] == [12.5, 13.5]
+
+
+def test_a_packet_that_arrives_after_its_day_was_written_joins_it(tmp_path):
+    """Appending is a second gzip member, and reads back as one stream."""
+    store = a_store(tmp_path)
+    long_ago = START - 40 * 86400
+    store.add(packet(long_ago + 10, outTemp=1.0))
+    store.trim(START - 86400)
+
+    # Late, for a day that has already gone to file.
+    store.add(packet(long_ago + 20, outTemp=2.0))
+    store.trim(START - 86400)
+    back = [p['outTemp'] for p in store.packets(long_ago, long_ago + INTERVAL)]
+    store.close()
+
+    assert back == [1.0, 2.0]
+
+
+def test_old_day_files_are_deleted(tmp_path):
+    store = a_store(tmp_path)
+    for days in (400, 300, 40):
+        when = START - days * 86400
+        store.add(packet(when + 10))
+        store.trim(when + 86400)
+    before = len(os.listdir(str(tmp_path / 'packets')))
+
+    gone = store.trim_archive(START - 365 * 86400)
+    after = len(os.listdir(str(tmp_path / 'packets')))
+    store.close()
+
+    assert before == 3
+    assert gone == 1
+    assert after == 2
+
+
+def test_a_record_is_still_put_right_from_a_day_file(config, tmp_path):
+    """The point of keeping the days: a late packet from weeks back still works."""
+    station = Station(config)
+    try:
+        store = station.store_service.store
+        weeks_ago = START - 30 * 86400
+        for n in range(1, 10):
+            store.add(packet(weeks_ago + n * 20, outTemp=10.0))
+        # Push that day out of the database and into a file.
+        store.trim(START - 7 * 86400)
+        assert store.has_day(weeks_ago)
+
+        # A late reading for it, and a recent packet so the period counts as closed.
+        store.add(packet(weeks_ago + 100, extraTemp3=41.2))
+        store.add(packet(START + 10))
+        station.store_service.post_loop(None)
+
+        written = station.record(weeks_ago + INTERVAL)
+        assert written is not None
+        assert written['extraTemp3'] == 41.2
+        # Nine readings of 10 out of the file, plus the late one at 20. Had the file
+        # not been read, the record would say 20.
+        assert written['outTemp'] == pytest.approx(11.0)
+    finally:
+        station.close()
+
+
+def test_zero_means_the_day_files_are_kept_for_ever(tmp_path):
+    config = make_config(tmp_path, archive_days=0)
+    station = Station(config)
+    try:
+        store = station.store_service.store
+        long_ago = START - 400 * 86400
+        store.add(packet(long_ago + 10, outTemp=3.0))
+        store.trim(long_ago + 2 * 86400)
+        assert store.has_day(long_ago)
+
+        # A trim that would delete anything older than "now" leaves it alone.
+        station.store_service.last_trim = 0
+        station.store_service._trim()
+
+        assert store.has_day(long_ago)
+        assert [p['outTemp'] for p in store.packets(long_ago, long_ago + INTERVAL)]             == [3.0]
+    finally:
+        station.close()
+
+
+def test_without_a_directory_nothing_is_written_out(tmp_path):
+    """A store with nowhere to put the days just drops them, as before."""
+    store = weewx.loopstore.LoopStore(
+        {'database_name': 'nodir.sdb', 'database_type': 'SQLite',
+         'driver': 'weedb.sqlite', 'SQLITE_ROOT': str(tmp_path)},
+        archive_dir=None)
+    long_ago = START - 40 * 86400
+    store.add(packet(long_ago + 10))
+    moved = store.trim(START - 86400)
+    left = store.count()
+    store.close()
+
+    assert moved == 1
+    assert left == 0
 
 
 # ==============================================================================

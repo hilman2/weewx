@@ -29,8 +29,11 @@ nothing to do with the archive, and a backup can leave it out.
 
 import contextlib
 import datetime
+import glob
+import gzip
 import json
 import logging
+import os
 import time
 
 import weedb
@@ -44,13 +47,20 @@ from weeutil.weeutil import timestamp_to_string, to_bool, to_int
 log = logging.getLogger(__name__)
 
 DEFAULT_BINDING = 'loop_binding'
+# How long the packets stay in the database, where they can be queried by time.
 DEFAULT_RETAIN_DAYS = 7
-# How much of the store to look over at startup, in days. Whatever went missing while
-# weewx was not running is found there.
-DEFAULT_CATCHUP_DAYS = 2
+# How long they are kept afterwards, one gzipped NDJSON file per day. Measured on
+# real LOOP packets, that is about a thirtieth of the space the database takes, so a
+# year of eight-second data is a hundred megabytes or so.
+DEFAULT_ARCHIVE_DAYS = 365
+ARCHIVE_DIRNAME = 'packets'
 METADATA_TABLE = 'loop_metadata'
 # When the store was last trimmed, so that it survives a restart.
 LAST_TRIM = 'lastTrim'
+# The sequence number up to which the archive has been checked against the
+# packets. Everything after it belongs to a period that may need working out
+# again. Kept in the store, so an abrupt stop cannot lose the mark.
+APPLIED_THROUGH = 'appliedThrough'
 
 # Everything a packet carries goes into 'data' as JSON, so that a new sensor needs no
 # schema change. 'seq' is the order of arrival, which is what tells 'first' and 'last'
@@ -76,8 +86,12 @@ schema = {'table': table}
 class LoopStore:
     """The packets, in a table of their own."""
 
-    def __init__(self, database_dict, table_name='packets'):
+    def __init__(self, database_dict, table_name='packets', archive_dir=None):
         self.table_name = table_name
+        # Where the days that have left the database are kept, one gzipped NDJSON
+        # file each. Beside the database, because that is the directory weewx already
+        # writes to and people already back up.
+        self.archive_dir = archive_dir
         try:
             self.connection = weedb.connect(database_dict)
         except weedb.NoDatabaseError:
@@ -90,7 +104,7 @@ class LoopStore:
 
     @classmethod
     def open_with_config(cls, config_dict, binding=DEFAULT_BINDING,
-                         archive_binding='wx_binding'):
+                         archive_binding='wx_binding', archive_dir=None):
         try:
             manager_dict = weewx.manager.get_manager_dict_from_config(config_dict,
                                                                       binding)
@@ -102,7 +116,9 @@ class LoopStore:
             log.info("No '%s' in [DataBindings]. Keeping the packets in '%s'.",
                      binding, manager_dict['database_dict'].get('database_name'))
         return cls(manager_dict['database_dict'],
-                   manager_dict.get('table_name', 'packets'))
+                   manager_dict.get('table_name', 'packets'),
+                   archive_dir=archive_dir or _archive_dir_for(
+                       manager_dict['database_dict']))
 
     def close(self):
         if self.connection:
@@ -132,17 +148,94 @@ class LoopStore:
         return self.seq
 
     def trim(self, before_ts):
-        """Drop everything older than a timestamp. Returns how many went."""
+        """Move everything older than a timestamp out of the database.
+
+        Each whole day goes into a gzipped NDJSON file of its own first, so that
+        leaving the database is not the same as being thrown away. Returns how many
+        packets left the database.
+        """
+        oldest = self.span()[0]
+        if oldest is None:
+            return 0
+        day = weeutil.weeutil.startOfArchiveDay(oldest)
+        while day + 86400 <= before_ts:
+            self.archive_day(day)
+            day += 86400
         with weedb.Transaction(self.connection) as cursor:
             cursor.execute("DELETE FROM %s WHERE dateTime < ?" % self.table_name,
                            (int(before_ts),))
             count = cursor.rowcount
         return count if count and count > 0 else 0
 
+    def archive_day(self, day_ts):
+        """Write a day's packets out as gzipped NDJSON. Returns how many were written.
+
+        Appending is a second gzip member, which is what gzip concatenation is, and
+        `zcat` reads it as one stream. That is how a packet which arrives after its
+        day has been written still ends up in the right file.
+        """
+        if not self.archive_dir:
+            return 0
+        packets = list(self.packets(day_ts - 1, day_ts + 86400, files=False))
+        if not packets:
+            return 0
+        path = self.day_path(day_ts)
+        try:
+            if not os.path.isdir(self.archive_dir):
+                os.makedirs(self.archive_dir)
+            with gzip.open(path, 'ab') as fd:
+                for packet in packets:
+                    line = json.dumps(packet, separators=(',', ':')) + '\n'
+                    fd.write(line.encode('utf-8'))
+        except OSError as e:
+            log.error("Cannot write %s: %s. Those packets will be lost when the "
+                      "database is trimmed.", path, e)
+            return 0
+        log.info("Wrote %d packet(s) to %s", len(packets), path)
+        return len(packets)
+
+    def day_path(self, day_ts):
+        """The file a day's packets live in."""
+        name = time.strftime('%Y-%m-%d', time.localtime(day_ts)) + '.ndjson.gz'
+        return os.path.join(self.archive_dir or '', name)
+
+    def has_day(self, ts):
+        """Whether the day a timestamp falls in has been written out."""
+        if not self.archive_dir:
+            return False
+        return os.path.exists(self.day_path(weeutil.weeutil.startOfArchiveDay(ts)))
+
+    def trim_archive(self, before_ts):
+        """Delete day files older than a timestamp. Returns how many went."""
+        if not self.archive_dir or not os.path.isdir(self.archive_dir):
+            return 0
+        gone = 0
+        for path in glob.glob(os.path.join(self.archive_dir, '*.ndjson.gz')):
+            try:
+                day = time.mktime(time.strptime(
+                    os.path.basename(path)[:10], '%Y-%m-%d'))
+            except ValueError:
+                continue
+            if day + 86400 <= before_ts:
+                try:
+                    os.remove(path)
+                    gone += 1
+                except OSError as e:
+                    log.warning("Cannot remove %s: %s", path, e)
+        return gone
+
     # ------------------------------------------------------------------ reading
 
-    def packets(self, start_ts, stop_ts):
-        """Every packet in (start_ts, stop_ts], in the order it arrived."""
+    def packets(self, start_ts, stop_ts, files=True):
+        """Every packet in (start_ts, stop_ts], in the order it arrived.
+
+        The written-out days come first, then whatever is still in the database. A
+        packet is in one or the other, never both: a day is written out on its way out
+        of the database.
+        """
+        if files:
+            for packet in self._packets_from_files(start_ts, stop_ts):
+                yield packet
         cursor = self.connection.cursor()
         try:
             cursor.execute("SELECT dateTime, usUnits, data FROM %s "
@@ -153,6 +246,49 @@ class LoopStore:
                 packet['dateTime'] = row[0]
                 packet['usUnits'] = row[1]
                 yield packet
+        finally:
+            cursor.close()
+
+    def _packets_from_files(self, start_ts, stop_ts):
+        """The same, out of the day files a span touches."""
+        if not self.archive_dir:
+            return
+        day = weeutil.weeutil.startOfArchiveDay(start_ts)
+        while day <= stop_ts:
+            path = self.day_path(day)
+            day += 86400
+            if not os.path.exists(path):
+                continue
+            try:
+                with gzip.open(path, 'rt', encoding='utf-8') as fd:
+                    for line in fd:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        packet = json.loads(line)
+                        if start_ts < packet.get('dateTime', 0) <= stop_ts:
+                            yield packet
+            except (OSError, ValueError) as e:
+                log.error("Cannot read %s: %s", path, e)
+
+    def times_after(self, seq):
+        """The timestamps of every packet that arrived after a sequence number."""
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("SELECT DISTINCT dateTime FROM %s WHERE seq > ?"
+                           % self.table_name, (int(seq),))
+            return [row[0] for row in cursor]
+        finally:
+            cursor.close()
+
+    def max_seq_through(self, stop_ts):
+        """The highest sequence number among packets up to a time, or 0."""
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("SELECT MAX(seq) FROM %s WHERE dateTime <= ?"
+                           % self.table_name, (int(stop_ts),))
+            row = cursor.fetchone()
+            return row[0] if row and row[0] is not None else 0
         finally:
             cursor.close()
 
@@ -220,6 +356,16 @@ class LoopStore:
             cursor.close()
 
 
+def _archive_dir_for(database_dict):
+    """Where a database's written-out days go: a directory beside it.
+
+    Only SQLite says where it lives. For anything else there is no obvious place, so
+    the days are not written out unless a directory is configured.
+    """
+    root = database_dict.get('SQLITE_ROOT')
+    return os.path.join(root, ARCHIVE_DIRNAME) if root else None
+
+
 def _beside_the_archive(config_dict, archive_binding='wx_binding'):
     """A manager dictionary for a store that sits next to the archive.
 
@@ -278,8 +424,9 @@ class StdLoopStore(weewx.engine.StdService):
         self.data_binding = store_dict.get('data_binding', DEFAULT_BINDING)
         self.archive_binding = archive_dict.get('data_binding', 'wx_binding')
         self.retain_days = to_int(store_dict.get('retain_days', DEFAULT_RETAIN_DAYS))
-        self.catchup_days = to_int(store_dict.get('catchup_days',
-                                                  DEFAULT_CATCHUP_DAYS))
+        self.archive_days = to_int(store_dict.get('archive_days',
+                                                  DEFAULT_ARCHIVE_DAYS))
+        self.archive_dir = store_dict.get('archive_dir') or None
         # Which field of a packet says where it came from. Recorded for diagnosis;
         # nothing is decided by it.
         self.source_field = store_dict.get('source_field', 'station')
@@ -288,8 +435,6 @@ class StdLoopStore(weewx.engine.StdService):
         self.loop_hilo = to_bool(archive_dict.get('loop_hilo', True))
 
         self.store = None
-        # Periods that received a packet this time round the loop.
-        self.touched = set()
 
         if not to_bool(store_dict.get('enable', True)):
             log.info("Loop store is disabled.")
@@ -297,7 +442,8 @@ class StdLoopStore(weewx.engine.StdService):
 
         try:
             self.store = LoopStore.open_with_config(config_dict, self.data_binding,
-                                                    self.archive_binding)
+                                                    self.archive_binding,
+                                                    self.archive_dir)
         except (weedb.DatabaseError, KeyError, AttributeError) as e:
             log.error("Cannot open the loop store using binding '%s': %s. Archive "
                       "records will not be checked against the packets.",
@@ -309,8 +455,10 @@ class StdLoopStore(weewx.engine.StdService):
         # to it.
         self.last_trim = to_int(self.store.get_metadata(LAST_TRIM, 0)) or time.time()
 
-        log.info("Loop store will use data binding %s, keeping %d days",
-                 self.data_binding, self.retain_days)
+        log.info("Loop store will use data binding %s, keeping %d days in the "
+                 "database and %d days in %s",
+                 self.data_binding, self.retain_days, self.archive_days,
+                 self.store.archive_dir or 'no directory')
 
         self.bind(weewx.STARTUP, self.startup)
         self.bind(weewx.NEW_LOOP_PACKET, self.new_loop_packet)
@@ -324,51 +472,64 @@ class StdLoopStore(weewx.engine.StdService):
     # ------------------------------------------------------------------- events
 
     def startup(self, _event):
-        """Look over what was stored while weewx was not running."""
+        """Take up wherever the last run left off."""
         # The console's own archive interval wins, the same way StdArchive decides it.
         try:
             self.archive_interval = self.engine.console.archive_interval
         except (AttributeError, NotImplementedError):
             pass
 
-        oldest, newest = self.store.span()
-        if oldest is None:
-            return
-        horizon = max(oldest, time.time() - self.catchup_days * 86400)
-        try:
-            filled = self._reconcile(self._periods_between(horizon, newest))
-        except weedb.DatabaseError as e:
-            log.error("Could not check the archive against the stored packets: %s", e)
-            return
-        if filled:
-            log.info("Filled in %d archive record(s) from stored packets.", filled)
+        changed = self._catch_up()
+        if changed:
+            log.info("Put %d archive record(s) right from stored packets.", changed)
 
     def new_loop_packet(self, event):
-        """Store the packet, and note which period it belongs to."""
+        """Store the packet. What to do about it is decided after the loop."""
         packet = event.packet
         try:
             self.store.add(packet, source=packet.get(self.source_field))
         except (weedb.DatabaseError, TypeError, ValueError) as e:
             log.error("Cannot store a LOOP packet from %s: %s",
                       timestamp_to_string(packet.get('dateTime')), e)
-            return
-        self.touched.add(weeutil.weeutil.startOfInterval(packet['dateTime'],
-                                                         self.archive_interval))
 
     def post_loop(self, _event):
-        """StdArchive has had its turn. See whether the packets say anything more."""
-        if not self.touched:
-            return
-        # A period that has not ended yet is still StdArchive's business.
-        newest = self.store.span()[1] or 0
-        due = {start for start in self.touched
-               if start + self.archive_interval <= newest}
-        self.touched -= due
+        """StdArchive has had its turn. See whether the packets say anything else."""
+        self._catch_up()
         try:
-            self._reconcile(sorted(due))
             self._trim()
         except weedb.DatabaseError as e:
+            log.error("Could not trim the loop store: %s", e)
+
+    def _catch_up(self):
+        """Deal with every packet that has arrived since the last time round.
+
+        The mark lives in the store, next to the packets it refers to, so an abrupt
+        stop cannot lose it and a restart does not go over the same ground again.
+        """
+        try:
+            applied = to_int(self.store.get_metadata(APPLIED_THROUGH, 0))
+            times = self.store.times_after(applied)
+            if not times:
+                return 0
+            newest = self.store.span()[1] or 0
+            # A period that has not ended yet is still StdArchive's business.
+            due = sorted({weeutil.weeutil.startOfInterval(ts, self.archive_interval)
+                          for ts in times
+                          if weeutil.weeutil.startOfInterval(ts, self.archive_interval)
+                          + self.archive_interval <= newest})
+            if not due:
+                return 0
+            changed = self._reconcile(due)
+            # Everything up to the end of the last period dealt with is now accounted
+            # for. Later packets belong to a period still open, and keep their place
+            # in the queue.
+            self.store.set_metadata(
+                APPLIED_THROUGH,
+                self.store.max_seq_through(due[-1] + self.archive_interval))
+            return changed
+        except weedb.DatabaseError as e:
             log.error("Could not check the archive against the stored packets: %s", e)
+            return 0
 
     # ------------------------------------------------------------------ the work
 
@@ -385,13 +546,25 @@ class StdLoopStore(weewx.engine.StdService):
         if not starts:
             return 0
         dbmanager = self.engine.db_binder.get_manager(self.archive_binding)
+        # A period can only be worked out again where the whole of it is still held:
+        # in the database, or in the day file it was written out to. Beyond that there
+        # is no telling what survived the trimming, and a record made from a hundred
+        # packets would be replaced by one made from a handful.
+        horizon = time.time() - self.retain_days * 86400
+        # Zero means the day files are never deleted, so nothing is out of reach.
+        keep_from = (time.time() - self.archive_days * 86400) if self.archive_days else 0
         changed = []
+        too_old = []
         for start in sorted(starts):
             stop = start + self.archive_interval
             built = self._record_for(start, stop)
             if built is None:
                 continue
             record, count = built
+            if start < horizon and not (start >= keep_from
+                                        and self.store.has_day(start)):
+                too_old.append(stop)
+                continue
             existing = dbmanager.getRecord(stop)
             if existing is None:
                 log.info("No archive record for %s. Writing one from %d stored "
@@ -407,6 +580,12 @@ class StdLoopStore(weewx.engine.StdService):
                 dbmanager.addRecord(record, update=True)
             changed.append(stop)
 
+        if too_old:
+            log.warning("%d archive period(s) have late packets but are no longer held "
+                        "whole, the oldest %s. Left alone, because working one out "
+                        "from what survived the trimming would lose the rest. Raise "
+                        "'archive_days', or use 'weectl import --update' for data that "
+                        "old.", len(too_old), timestamp_to_string(min(too_old)))
         if changed:
             self._rebuild_days(dbmanager, changed)
         return len(changed)
@@ -520,5 +699,10 @@ class StdLoopStore(weewx.engine.StdService):
         self.store.set_metadata(LAST_TRIM, int(now))
         gone = self.store.trim(now - self.retain_days * 86400)
         if gone:
-            log.info("Dropped %d stored packet(s) older than %d days.",
+            log.info("Moved %d packet(s) older than %d days out of the database.",
                      gone, self.retain_days)
+        dropped = (self.store.trim_archive(now - self.archive_days * 86400)
+                   if self.archive_days else 0)
+        if dropped:
+            log.info("Deleted %d day file(s) older than %d days.",
+                     dropped, self.archive_days)

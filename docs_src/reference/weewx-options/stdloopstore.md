@@ -31,18 +31,52 @@ quietly coarsen them.
 
 Set to `False` to keep no packets at all. Default is `True`.
 
+## Where the packets are kept
+
+The packets are held in two places, one after the other.
+
+While they are recent they live in a database table, indexed by time. When a day is
+older than `retain_days` it is written out as a single gzipped NDJSON file, one JSON
+object per line, and dropped from the table. Both are read when a record is worked out
+again, so it makes no difference to the result which of the two a packet is in.
+
+Measured on real LOOP packets, the file is about a thirtieth of what the same packets
+take up in the database: 27 bytes a packet against 911. A station reporting every eight
+seconds therefore writes about 10 MB a day into the table, and keeps a year of history
+in roughly 110 MB of files.
+
+The files sit in a directory called `packets` beside the database, and are ordinary
+gzipped text:
+
+```
+zcat /var/lib/weewx/packets/2026-08-25.ndjson.gz | head -1
+{"dateTime":1787664177,"usUnits":1,"outTemp":62.6,"windSpeed":3.4, ...}
+```
+
+A period can be worked out again as long as the whole of it is still held, in either
+place. Beyond that the periods are left alone and a warning says so: building a record
+from whatever survived the trimming would replace a hundred readings with a handful,
+which is worse than leaving it be. For data older than that, use
+`weectl import --update`.
+
 #### retain_days
 
-How long the packets are kept, in days. Default is `7`.
+How long the packets stay in the database, in days. Default is `7`.
 
-A station reporting every 60 seconds writes about 1,400 packets a day. One reporting
-every 8 seconds writes about 10,800. Set this to what your hardware can be late by,
-plus a margin, rather than to what your disk can hold.
+Set this to what your hardware can be late by, plus a margin. A station reporting every
+60 seconds writes about 1,400 packets a day, one reporting every 8 seconds about
+10,800.
 
-#### catchup_days
+#### archive_days
 
-How far back to look at startup for periods with packets but no archive record.
-Default is `2`.
+How long the day files are kept, in days. Default is `365`. Set to `0` to keep them
+for ever.
+
+#### archive_dir
+
+Where the day files go. Default is a directory called `packets` beside the database.
+Leave unset unless the database is not SQLite, in which case there is no obvious place
+and nothing is written out until this is given.
 
 #### data_binding
 
