@@ -60,17 +60,9 @@ def update_config(config_dict):
 def update_to_v55(config_dict):
     """Update a configuration file to V5.5
 
-    - Add the service StdLoopStore, and the binding and database it uses
+    - Add the binding and database for the ingest table, which StdArchive now works
+      every record out from
     """
-    services = config_dict.get('Engine', {}).get('Services')
-    if services is not None and 'archive_services' in services:
-        archive_services = services['archive_services']
-        if not isinstance(archive_services, list):
-            archive_services = [archive_services]
-        if 'weewx.loopstore.StdLoopStore' not in archive_services:
-            archive_services.append('weewx.loopstore.StdLoopStore')
-        services['archive_services'] = archive_services
-
     if 'DataBindings' in config_dict and 'loop_binding' not in config_dict['DataBindings']:
         config_dict['DataBindings']['loop_binding'] = {
             'database': 'loop_sqlite',
@@ -79,7 +71,8 @@ def update_to_v55(config_dict):
             'schema': 'weewx.loopstore.schema',
         }
         config_dict['DataBindings'].comments['loop_binding'] = [
-            '', 'Where the LOOP packets are kept. See [StdLoopStore].']
+            '', 'The ingest table: every LOOP packet, kept so that archive records',
+            'can be worked out from it. See [StdArchive].']
 
     if 'Databases' in config_dict and 'loop_sqlite' not in config_dict['Databases']:
         config_dict['Databases']['loop_sqlite'] = {

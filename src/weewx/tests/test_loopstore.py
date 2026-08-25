@@ -76,13 +76,12 @@ class FakeEngine:
 def make_config(tmp_path, **store_options):
     config = configobj.ConfigObj({
         'WEEWX_ROOT': str(tmp_path),
-        'StdArchive': {
+        'StdArchive': dict({
             'record_generation': 'software',
             'archive_interval': str(INTERVAL),
             'archive_delay': str(DELAY),
             'data_binding': 'wx_binding',
-        },
-        'StdLoopStore': {k: str(v) for k, v in store_options.items()},
+        }, **{k: str(v) for k, v in store_options.items()}),
         'Accumulator': {},
         'DatabaseTypes': {
             'SQLite': {'driver': 'weedb.sqlite', 'SQLITE_ROOT': str(tmp_path)},
@@ -114,14 +113,12 @@ def packet(timestamp, **values):
 
 
 class Station:
-    """StdArchive and StdLoopStore, fed the way StdEngine.run() feeds them."""
+    """One StdArchive, fed the way StdEngine.run() feeds it."""
 
-    def __init__(self, config_dict, with_store=True):
+    def __init__(self, config_dict):
         self.config_dict = config_dict
         self.engine = FakeEngine(config_dict)
         self.archive = weewx.engine.StdArchive(self.engine, config_dict)
-        self.store_service = weewx.loopstore.StdLoopStore(self.engine, config_dict) \
-            if with_store else None
         self.engine.dispatchEvent(weewx.Event(weewx.STARTUP))
         self.engine.dispatchEvent(weewx.Event(weewx.PRE_LOOP))
 
@@ -136,8 +133,7 @@ class Station:
         return self
 
     def close(self):
-        if self.store_service:
-            self.store_service.shutDown()
+        self.archive.shutDown()
         self.engine.db_binder.close()
 
     # ------------------------------------------------------------ what is stored
@@ -265,28 +261,20 @@ def test_it_falls_back_to_a_database_beside_the_archive(config):
 #                          nothing changes for a normal run
 # ==============================================================================
 
-def test_a_normal_run_writes_the_same_records(config, tmp_path):
-    """With every packet on time, the store changes nothing at all."""
-    packets = [packet(START + n * 20, outTemp=20.0 + n % 7) for n in range(1, 90)]
+def test_a_normal_run_writes_one_record_per_period(station):
+    """Every packet on time, which is what most stations do all day."""
+    station.feed(*[packet(START + n * 20, outTemp=20.0 + n % 7) for n in range(1, 90)])
 
-    without = Station(make_config(tmp_path / 'a'), with_store=False).feed(*packets)
-    plain = {r['dateTime']: dict(r) for r in without.records()}
-    without.close()
-
-    with_store = Station(make_config(tmp_path / 'b')).feed(*packets)
-    stored = {r['dateTime']: dict(r) for r in with_store.records()}
-    with_store.close()
-
-    assert sorted(plain) == sorted(stored)
-    for ts in plain:
-        assert plain[ts] == stored[ts], ts
+    assert station.times() == [START + INTERVAL, START + 2 * INTERVAL,
+                               START + 3 * INTERVAL, START + 4 * INTERVAL,
+                               START + 5 * INTERVAL]
 
 
 def test_the_store_holds_every_packet(station):
     packets = [packet(START + n * 20) for n in range(1, 40)]
     station.feed(*packets)
 
-    assert station.store_service.store.count() == len(packets)
+    assert station.archive.store.count() == len(packets)
 
 
 # ==============================================================================
@@ -367,11 +355,14 @@ def test_what_was_lost_while_weewx_was_down_is_found_at_startup(config):
     assert first.record(START + INTERVAL) is None
     first.close()
 
+    # A packet from the next period, as the console would have sent while weewx was
+    # down. It is what makes the earlier period finished.
+    store = weewx.loopstore.LoopStore.open_with_config(config)
+    store.add(packet(START + INTERVAL + 30))
+    store.close()
+
     second = Station(config)
-    # The startup pass needs to see the period as finished, so give it a later packet
-    # first. In a real restart the console supplies that within seconds.
-    second.store_service.store.add(packet(START + INTERVAL + 30))
-    second.store_service.startup(None)
+    second.archive.post_loop(None)
     found = second.record(START + INTERVAL)
     second.close()
 
@@ -541,7 +532,7 @@ def test_the_daily_summary_keeps_the_loop_highs_after_a_rebuild(station):
     # the range already seen, so the extremes should not move. Reconciled by hand, so
     # that no further record is written and the two measurements are of the same thing.
     station.feed(packet(START + 100, outTemp=12.0, rain=0.5))
-    station.store_service.post_loop(None)
+    station.archive.post_loop(None)
     after = station.day_summary('outTemp', START)
 
     # The extremes came from LOOP packets and did not move.
@@ -578,8 +569,10 @@ def test_a_period_older_than_the_retention_is_left_alone(station, caplog):
     station.manager._sync()
 
     with caplog.at_level(logging.WARNING):
-        station.store_service.store.add(packet(long_ago + 100, outTemp=99.0, rain=0.0))
-        station.store_service.post_loop(None)
+        station.archive.store.add(packet(long_ago + 100, outTemp=99.0, rain=0.0))
+        station.archive.latest_ts = None
+        station.archive._pick_up_where_we_left_off()
+        station.archive.post_loop(None)
 
     old_record = station.record(long_ago + INTERVAL)
     assert old_record['outTemp'] == 5.0        # untouched
@@ -596,10 +589,11 @@ def test_raising_the_retention_lets_older_periods_through(tmp_path):
     station = Station(config)
     try:
         long_ago = START - 60 * 86400
-        station.store_service.store.add(packet(long_ago + 100, outTemp=7.0))
-        station.store_service.store.add(packet(long_ago + 200, outTemp=9.0))
-        station.store_service.store.add(packet(START + 10))
-        station.store_service.post_loop(None)
+        station.archive.store.add(packet(long_ago + 100, outTemp=7.0))
+        station.archive.store.add(packet(long_ago + 200, outTemp=9.0))
+        station.archive.store.add(packet(START + 10))
+        station.archive._pick_up_where_we_left_off()
+        station.archive.post_loop(None)
 
         written = station.record(long_ago + INTERVAL)
         assert written is not None
@@ -613,7 +607,7 @@ def test_the_mark_survives_a_restart(config):
     first = Station(config)
     first.feed(*[packet(START + n * 20, outTemp=10.0) for n in range(1, 10)])
     first.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
-    mark = first.store_service.store.get_metadata(weewx.loopstore.APPLIED_THROUGH)
+    mark = first.archive.store.get_metadata(weewx.loopstore.APPLIED_THROUGH)
     first.close()
 
     assert mark is not None and int(mark) > 0
@@ -621,7 +615,7 @@ def test_the_mark_survives_a_restart(config):
     second = Station(config)
     try:
         # Nothing new has arrived, so the startup pass has nothing to do.
-        assert second.store_service._catch_up() == 0
+        assert len(second.archive._finished_periods()) == 0
     finally:
         second.close()
 
@@ -633,10 +627,11 @@ def test_a_packet_that_arrives_while_stopped_is_dealt_with_on_the_way_up(config)
     first.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
     assert first.record(START + INTERVAL)['extraTemp3'] is None
     # Straight into the store, as a driver would have done just before the stop.
-    first.store_service.store.add(packet(START + 100, extraTemp3=41.2))
+    first.archive.store.add(packet(START + 100, extraTemp3=41.2))
     first.close()
 
     second = Station(config)
+    second.archive.post_loop(None)
     found = second.record(START + INTERVAL)['extraTemp3']
     second.close()
 
@@ -761,7 +756,7 @@ def test_a_record_is_still_put_right_from_a_day_file(config, tmp_path):
     """The point of keeping the days: a late packet from weeks back still works."""
     station = Station(config)
     try:
-        store = station.store_service.store
+        store = station.archive.store
         weeks_ago = START - 30 * 86400
         for n in range(1, 10):
             store.add(packet(weeks_ago + n * 20, outTemp=10.0))
@@ -772,7 +767,8 @@ def test_a_record_is_still_put_right_from_a_day_file(config, tmp_path):
         # A late reading for it, and a recent packet so the period counts as closed.
         store.add(packet(weeks_ago + 100, extraTemp3=41.2))
         store.add(packet(START + 10))
-        station.store_service.post_loop(None)
+        station.archive._pick_up_where_we_left_off()
+        station.archive.post_loop(None)
 
         written = station.record(weeks_ago + INTERVAL)
         assert written is not None
@@ -788,15 +784,15 @@ def test_zero_means_the_day_files_are_kept_for_ever(tmp_path):
     config = make_config(tmp_path, archive_days=0)
     station = Station(config)
     try:
-        store = station.store_service.store
+        store = station.archive.store
         long_ago = START - 400 * 86400
         store.add(packet(long_ago + 10, outTemp=3.0))
         store.trim(long_ago + 2 * 86400)
         assert store.has_day(long_ago)
 
         # A trim that would delete anything older than "now" leaves it alone.
-        station.store_service.last_trim = 0
-        station.store_service._trim()
+        station.archive.last_trim = 0
+        station.archive._trim()
 
         assert store.has_day(long_ago)
         assert [p['outTemp'] for p in store.packets(long_ago, long_ago + INTERVAL)]             == [3.0]
@@ -824,28 +820,12 @@ def test_without_a_directory_nothing_is_written_out(tmp_path):
 #                            switches and failures
 # ==============================================================================
 
-def test_it_can_be_turned_off(tmp_path):
-    config = make_config(tmp_path, enable='false')
-    station = Station(config)
-    station.feed(*[packet(START + n * 20) for n in range(1, 20)])
-    store_missing = station.store_service.store is None
-    station.close()
-
-    assert store_missing
-    assert not os.path.exists(str(tmp_path / 'test-loop.sdb'))
-
-
-def test_a_store_that_cannot_be_opened_does_not_stop_weewx(tmp_path, caplog):
-    import logging
-
+def test_an_ingest_table_that_cannot_be_opened_says_so(tmp_path):
+    """Every record is worked out from it, so there is nothing to carry on with."""
     config = make_config(tmp_path)
     config['Databases']['loop_sqlite']['database_name'] = '/nowhere/at/all/x.sdb'
-    with caplog.at_level(logging.ERROR):
-        station = Station(config)
-        station.feed(*[packet(START + n * 20, outTemp=10.0) for n in range(1, 20)])
-        station.feed(packet(START + INTERVAL + 200))
-        written = station.record(START + INTERVAL)
-        station.close()
 
-    assert written['outTemp'] == 10.0        # the archive is unaffected
-    assert 'Cannot open the loop store' in caplog.text
+    with pytest.raises(weewx.engine.InitializationError) as caught:
+        Station(config)
+
+    assert 'ingest table' in str(caught.value)

@@ -17,10 +17,12 @@ import time
 import traceback
 
 # weewx imports:
+import weedb
 import weeutil.config
 import weeutil.logger
 import weeutil.weeutil
 import weewx.accum
+import weewx.loopstore
 import weewx.manager
 import weewx.qc
 import weewx.station
@@ -29,6 +31,15 @@ from weeutil.weeutil import to_bool, to_int, to_sorted_string
 from weewx import all_service_groups
 
 log = logging.getLogger(__name__)
+
+
+def _same_value(was, now):
+    """Whether two record values are the same number, allowing for float wobble."""
+    if was is None or now is None:
+        return was is None and now is None
+    if isinstance(was, float) or isinstance(now, float):
+        return abs(float(was) - float(now)) <= 1e-9 * max(1.0, abs(float(was)))
+    return was == now
 
 
 class BreakLoop(Exception):
@@ -557,11 +568,15 @@ class StdArchive(StdService):
         self.end_archive_period_ts = None
         # The timestamp that marks the end of the archive period, plus a delay
         self.end_archive_delay_ts = None
-        # The accumulator to be used for the current archive period
-        self.accumulator = None
-        # The accumulator that was used for the last archive period. Set to None after it has
-        # been processed.
+        # Set while a record is being worked out, so that new_archive_record can
+        # augment it from the same packets. None the rest of the time.
         self.old_accumulator = None
+        # The newest packet timestamp seen. What "now" means for deciding which
+        # periods have closed, so that a replay behaves like live data.
+        self.latest_ts = None
+        # Periods that received a packet and have not been worked out yet.
+        self.touched = set()
+        self.last_trim = 0
 
         if self.record_generation == 'software':
             self.archive_interval = software_interval
@@ -596,6 +611,32 @@ class StdArchive(StdService):
 
         weewx.accum.initialize(config_dict)
 
+        # Every LOOP packet goes into the ingest table, and every archive record is
+        # worked out from it. Keeping the packets is what lets a reading that arrives
+        # after its period has closed still reach the record it belongs to, and what
+        # keeps a restart from losing the period it happened in.
+        self.retain_days = to_int(archive_dict.get('retain_days',
+                                                   weewx.loopstore.DEFAULT_RETAIN_DAYS))
+        self.archive_days = to_int(archive_dict.get('archive_days',
+                                                    weewx.loopstore.DEFAULT_ARCHIVE_DAYS))
+        # Which field of a packet says where it came from. Recorded for diagnosis when
+        # several sources report to one WeeWX; nothing is decided by it.
+        self.source_field = archive_dict.get('source_field', 'station')
+        try:
+            self.store = weewx.loopstore.LoopStore.open_with_config(
+                config_dict,
+                archive_dict.get('ingest_binding', weewx.loopstore.DEFAULT_BINDING),
+                self.data_binding,
+                archive_dict.get('archive_dir') or None)
+        except (weedb.DatabaseError, OSError) as e:
+            # Every archive record is worked out from this table, so there is nothing
+            # to carry on with. Say what is wrong rather than fail somewhere later.
+            raise InitializationError(
+                "Cannot open the ingest table, which is where LOOP packets are kept "
+                "and every archive record is worked out from: %s" % e)
+        self.last_trim = to_int(
+            self.store.get_metadata(weewx.loopstore.LAST_TRIM, 0)) or time.time()
+
         self.bind(weewx.STARTUP, self.startup)
         self.bind(weewx.PRE_LOOP, self.pre_loop)
         self.bind(weewx.NEW_LOOP_PACKET, self.new_loop_packet)
@@ -620,6 +661,12 @@ class StdArchive(StdService):
         # Backfill the daily summaries.
         _nrecs, _ndays = dbmanager.backfill_day_summary()
 
+        # Periods that received packets but were never worked out, because the last
+        # run stopped between the two. Without this a restart in the middle of a
+        # period loses that period, which is one of the things the ingest table is
+        # for.
+        self._pick_up_where_we_left_off()
+
         # Do a catch-up on any data still on the station, but not yet put in the database.
         if self.no_catchup:
             log.debug("No catchup specified.")
@@ -643,23 +690,23 @@ class StdArchive(StdService):
         self.old_accumulator = None
 
     def new_loop_packet(self, event):
-        """Called when A new LOOP record has arrived."""
+        """Called when a new LOOP record has arrived.
 
-        # Do we have an accumulator at all? If not, create one:
-        if not self.accumulator:
-            self.accumulator = self._new_accumulator(event.packet['dateTime'])
-
-        # Try adding the LOOP packet to the existing accumulator. If the
-        # timestamp is outside the timespan of the accumulator, an exception
-        # will be thrown:
+        The packet goes into the ingest table, and that is the whole of it. Nothing is
+        accumulated in memory, so nothing is lost to a restart, and a packet whose
+        timestamp belongs to an earlier period simply lands in that period.
+        """
+        timestamp = event.packet['dateTime']
+        self.latest_ts = timestamp if self.latest_ts is None \
+            else max(self.latest_ts, timestamp)
         try:
-            self.accumulator.addRecord(event.packet, add_hilo=self.loop_hilo)
-        except weewx.accum.OutOfSpan:
-            # Shuffle accumulators:
-            (self.old_accumulator, self.accumulator) = \
-                (self.accumulator, self._new_accumulator(event.packet['dateTime']))
-            # Try again:
-            self.accumulator.addRecord(event.packet, add_hilo=self.loop_hilo)
+            self.store.add(event.packet, source=event.packet.get(self.source_field))
+        except (weedb.DatabaseError, TypeError, ValueError) as e:
+            log.error("Cannot store the LOOP packet from %s: %s",
+                      weeutil.weeutil.timestamp_to_string(timestamp), e)
+            return
+        self.touched.add(weeutil.weeutil.startOfInterval(timestamp,
+                                                         self.archive_interval))
 
     def check_loop(self, event):
         """Called after any loop packets have been processed. This is the opportunity
@@ -679,11 +726,88 @@ class StdArchive(StdService):
             raise BreakLoop
 
     def post_loop(self, _event):
-        """The main packet loop has ended, so process the old accumulator."""
-        # If weewx happens to startup in the small time interval between the end of
-        # the archive interval and the end of the archive delay period, then
-        # there will be no old accumulator. Check for this.
-        if self.old_accumulator:
+        """The main packet loop has ended, so work out the periods that have closed.
+
+        A record is what the packets of its period add up to, so every period that
+        received something and has since ended is worked out from the ingest table.
+        Where a record for it is already in the database and the packets no longer
+        agree with it, which is what a late packet does, it is written again.
+        """
+        done = self._finished_periods()
+        for start in done:
+            try:
+                self._emit(start)
+            except (weedb.DatabaseError, weewx.accum.OutOfSpan) as e:
+                log.error("Could not work out the record for %s: %s",
+                          weeutil.weeutil.timestamp_to_string(start
+                                                              + self.archive_interval),
+                          e)
+        if done:
+            # Everything up to the end of the last period dealt with is accounted for.
+            # Later packets belong to a period still open and keep their place in the
+            # queue, so that a restart picks them up rather than going over old ground.
+            try:
+                self.store.set_metadata(
+                    weewx.loopstore.APPLIED_THROUGH,
+                    self.store.max_seq_through(done[-1] + self.archive_interval))
+            except weedb.DatabaseError as e:
+                log.error("Could not record how far the archive has been worked "
+                          "out: %s", e)
+        self._trim()
+
+        # Set the time of the next break loop:
+        self.end_archive_delay_ts = self.end_archive_period_ts + self.archive_delay
+
+    def _pick_up_where_we_left_off(self):
+        """Queue up the periods whose packets have not been through post_loop yet."""
+        try:
+            applied = to_int(self.store.get_metadata(weewx.loopstore.APPLIED_THROUGH, 0))
+            times = self.store.times_after(applied)
+        except weedb.DatabaseError as e:
+            log.error("Could not read the ingest table: %s", e)
+            return
+        if not times:
+            return
+        self.latest_ts = max(times) if self.latest_ts is None             else max(self.latest_ts, max(times))
+        self.touched.update(weeutil.weeutil.startOfInterval(ts, self.archive_interval)
+                            for ts in times)
+        log.info("%d packet(s) in the ingest table have not been archived yet.",
+                 len(times))
+
+    def _finished_periods(self):
+        """Periods that received a packet and have since ended, oldest first."""
+        if self.latest_ts is None:
+            return []
+        due = sorted(start for start in self.touched
+                     if start + self.archive_interval <= self.latest_ts)
+        self.touched.difference_update(due)
+        return due
+
+    def _emit(self, start):
+        """Turn one period into an archive record, or put an existing one right."""
+        stop = start + self.archive_interval
+        self.old_accumulator = self._accumulator_for(start, stop)
+        if self.old_accumulator is None:
+            return
+        if not self._held_whole(start):
+            # Only part of this period is still held; the rest has been trimmed away.
+            # A record built from what survived would be worse than the one already
+            # there, and where there is none, worse than nothing.
+            log.warning("Archive period %s has packets but is no longer held whole. "
+                        "Leaving it alone. Raise 'archive_days', or use 'weectl "
+                        "import --update' for data that old.",
+                        weeutil.weeutil.timestamp_to_string(stop))
+            self.old_accumulator = None
+            return
+        try:
+            existing = None if self.record_generation == 'hardware' \
+                else self._dbmanager().getRecord(stop)
+            if existing is not None:
+                # A record for this time is already in the database. Only a packet
+                # that arrived after it was written can have brought us back here.
+                self._revise(existing, stop)
+                return
+
             # If the user has requested software generation, then do that:
             if self.record_generation == 'software':
                 self._software_catchup()
@@ -698,10 +822,73 @@ class StdArchive(StdService):
             else:
                 raise ValueError("Unknown station record generation value %s"
                                  % self.record_generation)
+        finally:
             self.old_accumulator = None
 
-        # Set the time of the next break loop:
-        self.end_archive_delay_ts = self.end_archive_period_ts + self.archive_delay
+    def _revise(self, existing, stop):
+        """Write a record again because its packets no longer agree with it."""
+        dbmanager = self._dbmanager()
+        record = self.old_accumulator.getRecord()
+        record['interval'] = self.archive_interval / 60
+        differing = sorted(k for k, v in record.items()
+                           if k in dbmanager.sqlkeys
+                           and k not in ('dateTime', 'usUnits', 'interval')
+                           and not _same_value(existing.get(k), v))
+        if not differing:
+            return
+        log.info("Record %s no longer agrees with its packets on %s. Writing it again.",
+                 weeutil.weeutil.timestamp_to_string(stop), ', '.join(differing))
+        with weewx.loopstore.keeping_last_update(dbmanager):
+            dbmanager.addRecord(record, update=True)
+        weewx.loopstore.rebuild_day(dbmanager, stop, self.store,
+                                    self.archive_interval, self.loop_hilo)
+
+    def _held_whole(self, start):
+        """Whether the ingest table still has the whole of a period.
+
+        Inside the retention it does. Beyond that only if the day was written out to
+        a file and that file is still there.
+        """
+        now = time.time()
+        if start >= now - self.retain_days * 86400:
+            return True
+        if self.archive_days and start < now - self.archive_days * 86400:
+            return False
+        return self.store.has_day(start)
+
+    def _accumulator_for(self, start, stop):
+        """The packets of a period, accumulated, or None if there are none."""
+        accumulator = weewx.accum.Accum(weeutil.weeutil.TimeSpan(start, stop))
+        for packet in self.store.packets(start, stop):
+            try:
+                accumulator.addRecord(packet, add_hilo=self.loop_hilo)
+            except (weewx.accum.OutOfSpan, ValueError) as e:
+                log.debug("Ignoring a stored packet from %s: %s",
+                          weeutil.weeutil.timestamp_to_string(packet.get('dateTime')), e)
+        return None if accumulator.isEmpty else accumulator
+
+    def _dbmanager(self):
+        return self.engine.db_binder.get_manager(self.data_binding)
+
+    def _trim(self):
+        """Move packets out of the ingest table once a day."""
+        now = time.time()
+        if now - self.last_trim < 86400:
+            return
+        self.last_trim = now
+        try:
+            self.store.set_metadata(weewx.loopstore.LAST_TRIM, int(now))
+            gone = self.store.trim(now - self.retain_days * 86400)
+            if gone:
+                log.info("Moved %d packet(s) older than %d days out of the ingest "
+                         "table.", gone, self.retain_days)
+            if self.archive_days:
+                dropped = self.store.trim_archive(now - self.archive_days * 86400)
+                if dropped:
+                    log.info("Deleted %d day file(s) older than %d days.",
+                             dropped, self.archive_days)
+        except weedb.DatabaseError as e:
+            log.error("Could not trim the ingest table: %s", e)
 
     def new_archive_record(self, event):
         """Called when a new archive record has arrived.
@@ -750,6 +937,11 @@ class StdArchive(StdService):
         except weewx.HardwareError as e:
             log.error("Internal error detected. Catchup abandoned")
             log.error("**** %s" % e)
+
+    def shutDown(self):
+        if self.store:
+            self.store.close()
+            self.store = None
 
     def _software_catchup(self):
         # Extract a record out of the old accumulator. 

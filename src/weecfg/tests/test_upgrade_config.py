@@ -178,17 +178,17 @@ class TestUpgrade:
         _check_against_expected(config_dict, 'expected/weewx43_expected.conf')
 
     def test_upgrade_v55(self):
-        """The loop store has to reach an installation that predates it"""
+        """The ingest table has to reach an installation that predates it"""
 
         config_dict = configobj.ConfigObj('weewx42.conf', encoding='utf-8')
 
         weecfg.update_config.update_to_v55(config_dict)
 
-        services = config_dict['Engine']['Services']['archive_services']
-        assert 'weewx.loopstore.StdLoopStore' in services
-        assert 'weewx.engine.StdArchive' in services
         assert config_dict['DataBindings']['loop_binding']['table_name'] == 'packets'
+        assert config_dict['DataBindings']['loop_binding']['manager']             == 'weewx.loopstore.LoopStore'
         assert config_dict['Databases']['loop_sqlite']['database_type'] == 'SQLite'
+        # StdArchive works the records out itself, so no new service is needed.
+        assert config_dict['Engine']['Services']['archive_services']             == 'weewx.engine.StdArchive'
 
     def test_upgrade_v55_twice(self):
         """Upgrading an already upgraded file must not double anything up"""
@@ -196,10 +196,11 @@ class TestUpgrade:
         config_dict = configobj.ConfigObj('weewx42.conf', encoding='utf-8')
 
         weecfg.update_config.update_to_v55(config_dict)
+        before = dict(config_dict['DataBindings']['loop_binding'])
         weecfg.update_config.update_to_v55(config_dict)
 
-        services = config_dict['Engine']['Services']['archive_services']
-        assert services.count('weewx.loopstore.StdLoopStore') == 1
+        assert dict(config_dict['DataBindings']['loop_binding']) == before
+        assert len(config_dict['Databases']) ==             len(set(config_dict['Databases'].keys()))
 
     def test_merge(self):
         """Test an upgrade against a typical user's configuration file"""
