@@ -8,19 +8,24 @@ The record is not a view of anything; it is the only copy. That is why a reading
 arrives after its archive period has ended cannot reach the record it belongs to, and
 why a restart in the middle of a period loses that period.
 
-With the packets kept, `StdLoopStore` compares them against the archive after
-`StdArchive` has had its turn:
+An archive record is a function of the LOOP packets of its period. With the packets
+kept, `StdLoopStore` works each period out again after `StdArchive` has had its turn
+and compares the result with the database. Where the two differ, the packets win: they
+are the measurements, the record is a summary of them.
 
 * A period that has packets but no archive record gets one.
-* A record with empty fields the packets can fill has them filled.
+* A record that does not agree with its packets is worked out again.
 
-Nothing is overwritten. A field that already holds a value keeps it, so a record can
-gain data but never change it. That covers a second console whose readings arrive a
-minute late, a sensor relayed through a service, and a restart between two archive
-records. It does not cover a late packet that would change an average which is already
-in the database.
+That covers a second console whose readings arrive a minute late, a sensor relayed
+through a service, and a restart between two archive records. Rain is why the record
+has to be worked out again rather than merely filled in: rainfall is a sum, and a late
+tip of the bucket cannot be added to a total that is already written.
 
-Only the fields being filled in reach the daily summaries, so no sum is counted twice.
+When a record changes, the daily summaries for that day are built again the way a live
+run builds them: the archive records give the sums and counts, and then the LOOP
+packets of each period lay their own highs and lows over the top. Those extremes are
+finer than any finished record can show, and rebuilding from the records alone would
+quietly coarsen them.
 
 #### enable
 

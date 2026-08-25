@@ -308,17 +308,36 @@ def test_a_late_reading_reaches_the_record_it_belongs_to(station):
     assert station.record(START + INTERVAL)['extraTemp3'] == 41.2
 
 
-def test_a_value_already_in_the_record_is_never_touched(station):
+def test_a_late_reading_is_worked_into_the_average(station):
+    """A record is what its packets say, so a late one changes the average."""
     station.feed(*[packet(START + n * 20, outTemp=10.0) for n in range(1, 10)])
     station.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
     assert station.record(START + INTERVAL)['outTemp'] == 10.0
 
-    # A late packet that would pull the average down. It must not.
-    station.feed(packet(START + 100, outTemp=-40.0))
+    station.feed(packet(START + 100, outTemp=20.0))
     station.feed(packet(START + 2 * INTERVAL + 10),
                  packet(START + 2 * INTERVAL + 200))
 
-    assert station.record(START + INTERVAL)['outTemp'] == 10.0
+    # Nine readings at 10 and one at 20.
+    assert station.record(START + INTERVAL)['outTemp'] == pytest.approx(11.0)
+
+
+def test_late_rain_is_not_lost(station):
+    """The reason a record has to be worked out again rather than filled in.
+
+    Rain is a sum. A late tip of the bucket cannot be added to a record that already
+    holds a rain value, so under a fill-only rule those millimetres are gone for good.
+    """
+    station.feed(*[packet(START + n * 20, rain=0.1) for n in range(1, 10)])
+    station.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
+    assert station.record(START + INTERVAL)['rain'] == pytest.approx(0.9)
+
+    station.feed(packet(START + 100, rain=0.5))
+    station.feed(packet(START + 2 * INTERVAL + 10),
+                 packet(START + 2 * INTERVAL + 200))
+
+    assert station.record(START + INTERVAL)['rain'] == pytest.approx(1.4)
+    assert station.day_summary('rain', START)['sum'] == pytest.approx(1.4)
 
 
 def test_a_period_with_no_record_at_all_gets_one(station):
@@ -460,31 +479,79 @@ def test_the_daily_summary_agrees_with_a_full_rebuild(station):
             assert kept[obs][column] == pytest.approx(rows[obs][column]),                 '%s.%s' % (obs, column)
 
 
-def test_filling_in_touches_nothing_but_the_field_it_fills(station):
-    """The guarantee for the daily summaries.
+def test_the_result_is_what_arriving_on_time_would_have_given(tmp_path):
+    """The promise, stated as a test.
 
-    Filling in a field adds that field and moves nothing else, not the sums, not the
-    counts, and not the highs and lows the LOOP packets set. Measured before and
-    after, with no other record written in between.
+    Two stations get the same readings. For one they all arrive in order; for the
+    other, three of them turn up after their archive period has been written. When the
+    store has done its work the two databases must agree, record for record and
+    summary for summary. Anything else is the late data leaving a mark, and it must
+    not leave one.
     """
-    station.feed(*[packet(START + n * 20, outTemp=10.0 + n % 5, rain=0.1,
-                          windSpeed=float(n % 9)) for n in range(1, 15)])
+    on_time = []
+    for n in range(1, 15):
+        on_time.append(packet(START + n * 20, outTemp=10.0 + n % 5, rain=0.1,
+                              windSpeed=float(n % 9), extraTemp3=30.0 + n))
+    tail = [packet(START + INTERVAL + 10), packet(START + INTERVAL + 200),
+            packet(START + 2 * INTERVAL + 10), packet(START + 2 * INTERVAL + 200)]
+
+    punctual = Station(make_config(tmp_path / 'punctual'))
+    punctual.feed(*(on_time + tail))
+    expected_records = {r['dateTime']: dict(r) for r in punctual.records()}
+    expected_days = {obs: punctual.day_summary(obs, START) for obs in OBSERVED}
+    punctual.close()
+
+    # The same readings, but three of them held back until after their period closed.
+    early, late = on_time[:-3], on_time[-3:]
+    delayed = Station(make_config(tmp_path / 'delayed'))
+    delayed.feed(*early)
+    delayed.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
+    delayed.feed(*late)
+    delayed.feed(packet(START + 2 * INTERVAL + 10),
+                 packet(START + 2 * INTERVAL + 200))
+    actual_records = {r['dateTime']: dict(r) for r in delayed.records()}
+    actual_days = {obs: delayed.day_summary(obs, START) for obs in OBSERVED}
+    delayed.close()
+
+    assert sorted(actual_records) == sorted(expected_records)
+    for ts in expected_records:
+        for key, value in expected_records[ts].items():
+            if isinstance(value, float):
+                assert actual_records[ts][key] == pytest.approx(value), '%s %s' % (ts, key)
+            else:
+                assert actual_records[ts][key] == value, '%s %s' % (ts, key)
+    for obs in OBSERVED:
+        assert actual_days[obs] == pytest.approx(expected_days[obs]), obs
+
+
+def test_the_daily_summary_keeps_the_loop_highs_after_a_rebuild(station):
+    """Rebuilding a day must not coarsen its highs and lows.
+
+    With loop_hilo set, the extremes come from the LOOP packets, and are finer than
+    anything a finished archive record can show. Rebuilding from the records alone
+    would quietly lose that, for the whole day.
+    """
+    station.feed(*[packet(START + n * 20, outTemp=10.0 + n % 5)
+                   for n in range(1, 15)])
     station.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
-    before = {obs: station.day_summary(obs, START) for obs in OBSERVED}
-    assert before['extraTemp3']['count'] == 0
+    before = station.day_summary('outTemp', START)
 
-    # A late reading for the period that is already written. Fed without letting the
-    # loop break, then reconciled by hand, so that no further record is written and
-    # the two measurements are of the same thing.
-    station.feed(packet(START + 100, extraTemp3=41.2))
+    # Force a rebuild with a late reading that carries rain. Its temperature is inside
+    # the range already seen, so the extremes should not move. Reconciled by hand, so
+    # that no further record is written and the two measurements are of the same thing.
+    station.feed(packet(START + 100, outTemp=12.0, rain=0.5))
     station.store_service.post_loop(None)
-    after = {obs: station.day_summary(obs, START) for obs in OBSERVED}
+    after = station.day_summary('outTemp', START)
 
-    assert station.record(START + INTERVAL)['extraTemp3'] == 41.2
-    for obs in ('outTemp', 'rain', 'windSpeed'):
-        assert after[obs] == before[obs], obs
-    assert after['extraTemp3']['count'] == 1
-    assert after['extraTemp3']['min'] == 41.2
+    # The extremes came from LOOP packets and did not move.
+    assert after['min'] == before['min']
+    assert after['max'] == before['max']
+
+    # And they really are finer than the records: every archive average of the day sits
+    # strictly inside them, so a rebuild from records alone would have narrowed the day.
+    averages = [r['outTemp'] for r in station.records() if r['outTemp'] is not None]
+    assert min(averages) > after['min']
+    assert max(averages) <= after['max']
 
 
 # ==============================================================================

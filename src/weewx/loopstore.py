@@ -28,6 +28,7 @@ nothing to do with the archive, and a backup can leave it out.
 """
 
 import contextlib
+import datetime
 import json
 import logging
 import time
@@ -372,69 +373,85 @@ class StdLoopStore(weewx.engine.StdService):
     # ------------------------------------------------------------------ the work
 
     def _reconcile(self, starts):
-        """Make the archive hold everything the packets have, for these periods.
+        """Make the archive say what the packets say, for these periods.
 
-        Returns how many records were written or filled in.
+        An archive record is a function of the LOOP packets of its period, so every
+        period with packets is worked out from them and compared with what is in the
+        database. Where the two differ, the packets win: they are the measurements,
+        the record is a summary of them.
+
+        Returns how many records were written or put right.
         """
         if not starts:
             return 0
         dbmanager = self.engine.db_binder.get_manager(self.archive_binding)
-        changed = 0
+        changed = []
         for start in sorted(starts):
             stop = start + self.archive_interval
             built = self._record_for(start, stop)
             if built is None:
                 continue
-            record, accumulator, count = built
+            record, count = built
             existing = dbmanager.getRecord(stop)
             if existing is None:
                 log.info("No archive record for %s. Writing one from %d stored "
                          "packet(s).", timestamp_to_string(stop), count)
-                with _keeping_last_update(dbmanager):
-                    dbmanager.addRecord(record, accumulator=accumulator)
-                changed += 1
-                continue
-            missing = self._missing_from(existing, record, dbmanager.sqlkeys)
-            if missing:
-                log.info("Filling in %s of archive record %s from stored packets.",
-                         ', '.join(sorted(missing)), timestamp_to_string(stop))
-                missing['dateTime'] = stop
-                missing['usUnits'] = existing['usUnits']
-                # 'interval' has to come along: the daily summary weights every record
-                # by it, and refuses one without.
-                missing['interval'] = existing.get('interval', record['interval'])
-                # Only the fields in 'missing' reach the daily summary, so nothing
-                # that was counted before is counted again. The accumulator that comes
-                # along knows only those fields as well: the whole one would raise the
-                # day's high for a field whose record value is staying as it is, and
-                # the summary would then disagree with the archive it summarises.
-                delta = self._accumulator_for(start, stop, set(missing))
-                with _keeping_last_update(dbmanager):
-                    dbmanager.addRecord(missing, accumulator=delta, update=True)
-                changed += 1
-        return changed
+            else:
+                differing = self._differences(existing, record, dbmanager.sqlkeys)
+                if not differing:
+                    continue
+                log.info("Archive record %s does not agree with its %d stored "
+                         "packet(s) on %s. Working it out again.",
+                         timestamp_to_string(stop), count, ', '.join(sorted(differing)))
+            with _keeping_last_update(dbmanager):
+                dbmanager.addRecord(record, update=True)
+            changed.append(stop)
 
-    def _accumulator_for(self, start, stop, fields):
-        """An accumulator over a period that knows only certain fields.
+        if changed:
+            self._rebuild_days(dbmanager, changed)
+        return len(changed)
 
-        Its highs and lows are to the LOOP packet, which is finer than anything that
-        can be worked out from a finished archive record.
+    def _rebuild_days(self, dbmanager, timestamps):
+        """Build the daily summaries of the days touched, the way a live run builds
+        them.
+
+        A changed record cannot be worked into a summary that already counts the old
+        one, so the day is built again from scratch. That is two steps, because a live
+        run also takes two: the archive records make the sums and counts, and then the
+        LOOP packets of each period lay their own highs and lows over the top, which
+        are finer than any finished record can show. Doing only the first would quietly
+        coarsen every high and low of the day.
         """
-        keep = set(fields) | {'dateTime', 'usUnits'}
-        accumulator = weewx.accum.Accum(weeutil.weeutil.TimeSpan(start, stop))
-        for packet in self.store.packets(start, stop):
+        days = sorted({weeutil.weeutil.startOfArchiveDay(ts) for ts in timestamps})
+        for day_ts in days:
+            day = datetime.date.fromtimestamp(day_ts)
             try:
-                accumulator.addRecord({k: v for k, v in packet.items() if k in keep},
-                                      add_hilo=self.loop_hilo)
-            except (weewx.accum.OutOfSpan, ValueError):
-                pass
-        return None if accumulator.isEmpty else accumulator
+                with _keeping_last_update(dbmanager):
+                    dbmanager.backfill_day_summary(start_d=day, stop_d=day,
+                                                   progress_fn=None)
+                    self._restore_loop_extremes(dbmanager, day_ts)
+            except (weewx.ViolatedPrecondition, weedb.DatabaseError,
+                    AttributeError) as e:
+                log.error("Could not rebuild the daily summary for %s: %s. Run "
+                          "'weectl database rebuild-daily' for that day.", day, e)
 
-    def _record_for(self, start, stop):
-        """What the stored packets for a period add up to.
+    def _restore_loop_extremes(self, dbmanager, day_ts):
+        """Lay the LOOP packets' highs and lows back over a rebuilt day."""
+        stop_ts = day_ts + 86400
+        oldest, newest = self.store.span()
+        if oldest is None:
+            return
+        first = max(day_ts, weeutil.weeutil.startOfInterval(oldest,
+                                                            self.archive_interval))
+        last = min(stop_ts, newest)
+        for start in self._periods_between(first, last):
+            accumulator = self._accumulator_for(start, start + self.archive_interval)
+            if accumulator is not None:
+                with weedb.Transaction(dbmanager.connection) as cursor:
+                    dbmanager._updateHiLo(accumulator, cursor)
 
-        Returns (record, accumulator, packet count), or None if there are no packets.
-        """
+    def _accumulator_for(self, start, stop):
+        """The stored packets of a period, accumulated, or None if there are none."""
         accumulator = weewx.accum.Accum(weeutil.weeutil.TimeSpan(start, stop))
         count = 0
         for packet in self.store.packets(start, stop):
@@ -446,24 +463,44 @@ class StdLoopStore(weewx.engine.StdService):
                           timestamp_to_string(packet.get('dateTime')), e)
         if accumulator.isEmpty:
             return None
+        accumulator.packet_count = count
+        return accumulator
+
+    def _record_for(self, start, stop):
+        """What the stored packets for a period add up to.
+
+        Returns (record, packet count), or None if there are no packets.
+        """
+        accumulator = self._accumulator_for(start, stop)
+        if accumulator is None:
+            return None
         record = accumulator.getRecord()
         record['interval'] = self.archive_interval / 60
-        return record, accumulator, count
+        return record, accumulator.packet_count
 
     @staticmethod
-    def _missing_from(existing, record, sqlkeys):
-        """Fields the packets have and the archive record has not.
+    def _differences(existing, record, sqlkeys):
+        """Where the archive record and the packets disagree.
 
-        Only ever fields that are absent or NULL. A value already in the database is
-        never touched, so a record can gain data but not change it. Fields with no
-        column are left out, the same way an archive record leaves them out, rather
-        than reported as filled in and then dropped.
+        Only columns the database has, and only real differences: a float that comes
+        back from SQLite a fraction out is the same number.
         """
-        return {key: value for key, value in record.items()
-                if key in sqlkeys
-                and key not in ('dateTime', 'usUnits', 'interval')
-                and value is not None
-                and existing.get(key) is None}
+        differing = set()
+        for key, value in record.items():
+            if key not in sqlkeys or key in ('dateTime', 'usUnits', 'interval'):
+                continue
+            was = existing.get(key)
+            if was is None:
+                if value is not None:
+                    differing.add(key)
+            elif value is None:
+                continue
+            elif isinstance(was, float) or isinstance(value, float):
+                if abs(float(was) - float(value)) > 1e-9 * max(1.0, abs(float(was))):
+                    differing.add(key)
+            elif was != value:
+                differing.add(key)
+        return differing
 
     def _periods_between(self, start_ts, stop_ts):
         """Every archive period start in a span, oldest first."""
