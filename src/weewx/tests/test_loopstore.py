@@ -955,3 +955,28 @@ def test_hardware_that_cannot_deliver_still_gets_records_put_right(tmp_path):
         assert station.day_summary('rain', START)['sum'] == pytest.approx(1.4)
     finally:
         station.close()
+
+
+def test_a_console_with_no_archive_is_noticed_at_startup(tmp_path):
+    """Otherwise nothing is ever put right on a station configured for hardware.
+
+    The flag starts from the configuration, and correcting it only where a record is
+    written from scratch is too late: a station whose periods all have records never
+    reaches that path, so a late packet would never change anything.
+    """
+    config = make_config(tmp_path, record_generation='hardware')
+    station = Station(config)
+    try:
+        assert station.archive.hardware_archive is False   # settled during startup
+
+        station.feed(*[packet(START + n * 20, outTemp=10.0) for n in range(1, 10)])
+        station.feed(packet(START + INTERVAL + 10), packet(START + INTERVAL + 200))
+        assert 'extraTemp3' not in station.record(START + INTERVAL)             or station.record(START + INTERVAL)['extraTemp3'] is None
+
+        station.feed(packet(START + 100, extraTemp3=41.2))
+        station.feed(packet(START + 2 * INTERVAL + 10),
+                     packet(START + 2 * INTERVAL + 200))
+
+        assert station.record(START + INTERVAL)['extraTemp3'] == 41.2
+    finally:
+        station.close()

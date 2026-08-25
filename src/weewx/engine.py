@@ -680,7 +680,13 @@ class StdArchive(StdService):
             try:
                 self._catchup(self.engine.console.genStartupRecords)
             except NotImplementedError:
-                pass
+                # And this is where we find out. Without it the flag would stay as the
+                # configuration left it until a record happens to be written from
+                # scratch, and until then no record would ever be put right.
+                if self.hardware_archive:
+                    log.info("The console has no archive of its own, so records are "
+                             "worked out from the LOOP packets.")
+                self.hardware_archive = False
 
     def pre_loop(self, _event):
         """Called before the main packet loop is entered."""

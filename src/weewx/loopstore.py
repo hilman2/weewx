@@ -454,13 +454,24 @@ def rebuild_day(dbmanager, ts, store, archive_interval, loop_hilo=True):
     day_ts = weeutil.weeutil.startOfArchiveDay(ts)
     day = datetime.date.fromtimestamp(day_ts)
     try:
+        # Rebuilding one day is refused unless the summaries are complete, which is
+        # decided by comparing the 'lastUpdate' marker against the newest record. The
+        # manager caches the latter, and writing an older record leaves that cache
+        # saying what it said before, so read it back first.
+        dbmanager._sync()
         with keeping_last_update(dbmanager):
             dbmanager.backfill_day_summary(start_d=day, stop_d=day, progress_fn=None)
             _restore_loop_extremes(dbmanager, day_ts, store, archive_interval,
                                    loop_hilo)
     except (weewx.ViolatedPrecondition, weedb.DatabaseError, AttributeError) as e:
-        log.error("Could not rebuild the daily summary for %s: %s. Run "
-                  "'weectl database rebuild-daily' for that day.", day, e)
+        marker = None
+        try:
+            marker = dbmanager._read_metadata('lastUpdate')
+        except Exception:                                    # noqa: BLE001
+            pass
+        log.error("Could not rebuild the daily summary for %s: %s (lastUpdate %s, "
+                  "newest record %s). Run 'weectl database rebuild-daily' for that "
+                  "day.", day, e, marker, getattr(dbmanager, 'last_timestamp', None))
 
 
 def _restore_loop_extremes(dbmanager, day_ts, store, archive_interval, loop_hilo):
