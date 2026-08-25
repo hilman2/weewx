@@ -157,13 +157,24 @@ class LoopStore:
         oldest = self.span()[0]
         if oldest is None:
             return 0
+        count = 0
         day = weeutil.weeutil.startOfArchiveDay(oldest)
         while day + 86400 <= before_ts:
-            self.archive_day(day)
+            # A day at a time, and only the packets that reached the file are dropped.
+            # Deleting more than was written would lose them; deleting less would
+            # leave them to be written a second time, and a packet counted twice
+            # moves the average it belongs to.
+            written = self.archive_day(day)
+            if written or not self.archive_dir:
+                count += self._drop_day(day)
             day += 86400
+        return count
+
+    def _drop_day(self, day_ts):
+        """Delete a day's packets from the database. Returns how many went."""
         with weedb.Transaction(self.connection) as cursor:
-            cursor.execute("DELETE FROM %s WHERE dateTime < ?" % self.table_name,
-                           (int(before_ts),))
+            cursor.execute("DELETE FROM %s WHERE dateTime > ? AND dateTime <= ?"
+                           % self.table_name, (int(day_ts) - 1, int(day_ts) + 86400))
             count = cursor.rowcount
         return count if count and count > 0 else 0
 
@@ -173,6 +184,9 @@ class LoopStore:
         Appending is a second gzip member, which is what gzip concatenation is, and
         `zcat` reads it as one stream. That is how a packet which arrives after its
         day has been written still ends up in the right file.
+
+        The packets stay in the database. Only `trim` takes them out, and only once
+        this has said how many reached the file.
         """
         if not self.archive_dir:
             return 0

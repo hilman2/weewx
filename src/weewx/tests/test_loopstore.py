@@ -706,6 +706,40 @@ def test_a_packet_that_arrives_after_its_day_was_written_joins_it(tmp_path):
     assert back == [1.0, 2.0]
 
 
+def test_a_day_that_could_not_be_written_stays_in_the_database(tmp_path):
+    """Losing the file must not also mean losing the packets."""
+    store = a_store(tmp_path)
+    long_ago = START - 40 * 86400
+    store.add(packet(long_ago + 10, outTemp=1.0))
+    store.add(packet(START))
+    # A directory that cannot be created, so the write fails.
+    store.archive_dir = '/nowhere/at/all/packets'
+
+    moved = store.trim(START - 86400)
+    left = store.count()
+    store.close()
+
+    assert moved == 0
+    assert left == 2          # both still there, nothing thrown away
+
+
+def test_a_packet_is_never_in_both_places(tmp_path):
+    """A packet counted twice would move the average it belongs to."""
+    store = a_store(tmp_path)
+    long_ago = START - 40 * 86400
+    for n in range(1, 6):
+        store.add(packet(long_ago + n * 20, outTemp=float(n)))
+    store.add(packet(START))
+
+    store.trim(START - 86400)
+    # Trimming again must not write the same packets out a second time.
+    store.trim(START - 86400)
+    back = [p['outTemp'] for p in store.packets(long_ago, long_ago + INTERVAL)]
+    store.close()
+
+    assert back == [1.0, 2.0, 3.0, 4.0, 5.0]
+
+
 def test_old_day_files_are_deleted(tmp_path):
     store = a_store(tmp_path)
     for days in (400, 300, 40):
