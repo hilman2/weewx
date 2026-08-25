@@ -576,6 +576,10 @@ class StdArchive(StdService):
         self.latest_ts = None
         # Periods that received a packet and have not been worked out yet.
         self.touched = set()
+        # Days whose summaries need building again, because a record in them was
+        # written a second time. Collected so that a block of late data costs one
+        # rebuild per day rather than one per record.
+        self.days_to_rebuild = set()
         self.last_trim = 0
 
         if self.record_generation == 'software':
@@ -756,6 +760,14 @@ class StdArchive(StdService):
                           weeutil.weeutil.timestamp_to_string(start
                                                               + self.archive_interval),
                           e)
+        if self.days_to_rebuild:
+            # Once per day touched, however many of its records were written again.
+            dbmanager = self._dbmanager()
+            for day_ts in sorted(self.days_to_rebuild):
+                weewx.loopstore.rebuild_day(dbmanager, day_ts + 1, self.store,
+                                            self.archive_interval, self.loop_hilo)
+            self.days_to_rebuild.clear()
+
         if done:
             # Everything up to the end of the last period dealt with is accounted for.
             # Later packets belong to a period still open and keep their place in the
@@ -844,7 +856,11 @@ class StdArchive(StdService):
                                 "--update' for data that old.",
                                 weeutil.weeutil.timestamp_to_string(stop))
                     return
-                self._revise(existing, stop)
+                if self._revise(existing, stop):
+                    # The day this record falls in has to be built again, but not
+                    # here: a block of late data puts a dozen records right at once,
+                    # and each rebuild reads the whole day.
+                    self.days_to_rebuild.add(weeutil.weeutil.startOfArchiveDay(stop))
                 return
 
             # If the user has requested software generation, then do that:
@@ -869,7 +885,10 @@ class StdArchive(StdService):
             self.old_accumulator = None
 
     def _revise(self, existing, stop):
-        """Write a record again because its packets no longer agree with it."""
+        """Write a record again because its packets no longer agree with it.
+
+        Returns True if anything changed.
+        """
         dbmanager = self._dbmanager()
         record = self.old_accumulator.getRecord()
         record['interval'] = self.archive_interval / 60
@@ -878,13 +897,12 @@ class StdArchive(StdService):
                            and k not in ('dateTime', 'usUnits', 'interval')
                            and not _same_value(existing.get(k), v))
         if not differing:
-            return
+            return False
         log.info("Record %s no longer agrees with its packets on %s. Writing it again.",
                  weeutil.weeutil.timestamp_to_string(stop), ', '.join(differing))
         with weewx.loopstore.keeping_last_update(dbmanager):
             dbmanager.addRecord(record, update=True)
-        weewx.loopstore.rebuild_day(dbmanager, stop, self.store,
-                                    self.archive_interval, self.loop_hilo)
+        return True
 
     def _held_whole(self, start):
         """Whether the ingest table still has the whole of a period.

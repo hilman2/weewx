@@ -1001,3 +1001,36 @@ def test_a_logger_keeps_its_authority_with_no_catchup(tmp_path):
         assert station.archive.hardware_archive is True
     finally:
         station.close()
+
+
+def test_a_block_of_late_data_rebuilds_the_day_once(station, caplog):
+    """What a DWD-style feed delivers: an hour of five-minute values, all at once.
+
+    Every one of them puts a record right, and each rebuild reads the whole day. One
+    per day is enough.
+    """
+    import logging
+
+    # An hour of readings, then two periods further on so they are all written.
+    for n in range(12):
+        station.feed(*[packet(START + n * INTERVAL + k * 20, outTemp=10.0)
+                       for k in range(1, 10)])
+    station.feed(packet(START + 12 * INTERVAL + 10),
+                 packet(START + 12 * INTERVAL + 200))
+    assert len(station.records()) >= 12
+
+    # The block arrives: one value per period, for the hour just gone.
+    with caplog.at_level(logging.INFO):
+        for n in range(12):
+            station.feed(packet(START + n * INTERVAL + 100, extraTemp3=20.0 + n))
+        station.feed(packet(START + 13 * INTERVAL + 10),
+                     packet(START + 13 * INTERVAL + 200))
+
+    revised = caplog.text.count('no longer agrees')
+    rebuilds = caplog.text.count('Starting backfill of daily summaries')
+    assert revised == 12, revised
+    assert rebuilds == 1, rebuilds
+
+    # And every one of them reached its record.
+    for n in range(12):
+        assert station.record(START + (n + 1) * INTERVAL)['extraTemp3'] == 20.0 + n
