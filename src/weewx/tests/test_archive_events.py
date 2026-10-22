@@ -150,3 +150,34 @@ def test_loop_hilo_disabled_keeps_statistics_unavailable(archive_engine):
     assert accumulator['outTemp'].min is None
     assert accumulator['outTemp'].max is None
     assert accumulator['outTemp'].avg == pytest.approx(10)
+
+
+@pytest.mark.parametrize('has_accumulator_attribute', [False, True])
+@pytest.mark.parametrize('offset', [300, 600])
+@pytest.mark.parametrize('augmentation', [True, False])
+def test_legacy_archive_events_preserve_optional_accumulator(archive_engine,
+                                                            has_accumulator_attribute,
+                                                            offset, augmentation):
+    engine, archive, _events = archive_engine
+    archive.record_augmentation = augmentation
+    feed_loop_interval(engine)
+    timestamp = BASE_TIME + offset
+    record = hardware_record(timestamp)
+    del record['inTemp']
+    event = weewx.Event(weewx.NEW_ARCHIVE_RECORD, record=record, origin='hardware')
+    if has_accumulator_attribute:
+        event.accumulator = None
+
+    engine.dispatchEvent(event)
+
+    primary = engine.db_binder.get_manager('wx_binding')
+    saved_record = primary.getRecord(timestamp)
+    uses_loop_statistics = not has_accumulator_attribute and offset == 600
+    expected_extremes = (0, 20) if uses_loop_statistics else (10, 10)
+    assert primary.getSql('SELECT min, max FROM archive_day_outTemp') \
+        == pytest.approx(expected_extremes)
+    assert saved_record['outTemp'] == pytest.approx(10)
+    if uses_loop_statistics and augmentation:
+        assert saved_record['inTemp'] == pytest.approx(21)
+    else:
+        assert saved_record['inTemp'] is None

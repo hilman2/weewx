@@ -1,6 +1,12 @@
 WeeWX change history
 --------------------
 
+### 5.x.y dd-Mmm-YYYY
+
+Accept archive events from extensions that omit the optional LOOP accumulator.
+Preserve the matching LOOP statistics for those events.
+[Issue #1171](https://github.com/weewx/weewx/issues/1171).
+
 ### 5.4.0 06/16/2026
 
 Added utility `weectl rest`, which allows selective uploading to RESTful

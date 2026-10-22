@@ -687,32 +687,35 @@ class StdArchive(StdService):
         self.end_archive_delay_ts = self.end_archive_period_ts + self.archive_delay
 
     def new_archive_record(self, event):
-        """Called when a new archive record has arrived.
-           Put it in the archive database.
-           
+        """Save an archive record and its available LOOP statistics.
+
         Args:
-            event.record(dict): the archive record
-            event.accumulator(weewx.accum.Accum): the corresponding
-                acculumator if any or `None` if not
-            event.origin(str): "hardware" or "software" depending on
-                the data source
+            event (weewx.Event): The archive record, its origin, and an optional
+                accumulator. Events without an accumulator attribute use the
+                completed LOOP accumulator if its ending timestamp matches.
         """
+
+        # An explicit None means no accumulator is available. Only older event
+        # producers that omit the attribute use the service's completed accumulator.
+        if hasattr(event, 'accumulator'):
+            accumulator = event.accumulator
+        else:
+            accumulator = self.old_accumulator
+            if accumulator and event.record['dateTime'] != accumulator.timespan.stop:
+                accumulator = None
 
         # If requested, extract any extra information we can out of the 
         # accumulator and put it in the record. Not necessary in the case 
         # of software record generation because it has already been done.
-        # Note: `event.accumulator` is `None` if the accumulator is missing
-        #       or does not correspond to `event.record`. That is checked in
-        #       `_chatchup`.
         if self.record_augmentation \
-                and event.accumulator \
+                and accumulator \
                 and event.origin != 'software':
-            event.accumulator.augmentRecord(event.record)
+            accumulator.augmentRecord(event.record)
 
         # Save the record to the database
         dbmanager = self.engine.db_binder.get_manager(self.data_binding)
         dbmanager.addRecord(event.record,
-                            accumulator=event.accumulator,
+                            accumulator=accumulator,
                             log_success=self.log_success,
                             log_failure=self.log_failure)
 
