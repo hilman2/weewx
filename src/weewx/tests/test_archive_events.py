@@ -17,7 +17,7 @@ BASE_TIME = 1700000100
 
 
 @pytest.fixture
-def archive_engine(tmp_path, monkeypatch):
+def archive_engine(tmp_path, monkeypatch, request):
     schema = {'dateTime': 'INTEGER NOT NULL PRIMARY KEY',
               'usUnits': 'INTEGER NOT NULL', 'interval': 'INTEGER NOT NULL',
               'outTemp': 'REAL'}
@@ -34,11 +34,13 @@ def archive_engine(tmp_path, monkeypatch):
         'Databases': {
             name: {'driver': 'weedb.sqlite', 'database_name': str(tmp_path / (name + '.sdb'))}
             for name in ['primary', 'secondary']}})
+    config.merge(getattr(request, 'param', {}))
     monkeypatch.setattr(weewx.accum, 'accum_dict', copy.deepcopy(weewx.accum.accum_dict))
     previous_timeout = socket.getdefaulttimeout()
     engine = weewx.engine.DummyEngine(config)
     try:
         engine.service_obj.append(weewx.engine.StdConvert(engine, config))
+        engine.service_obj.append(weewx.engine.StdCalibrate(engine, config))
         events = []
         # Read the attachment before StdArchive handles the event.
         engine.bind(weewx.NEW_ARCHIVE_RECORD,
@@ -181,3 +183,60 @@ def test_legacy_archive_events_preserve_optional_accumulator(archive_engine,
         assert saved_record['inTemp'] == pytest.approx(21)
     else:
         assert saved_record['inTemp'] is None
+
+
+def test_hardware_archive_preserves_console_average(archive_engine, monkeypatch):
+    engine, archive, _events = archive_engine
+    archive.record_generation = 'hardware'
+    record = hardware_record(BASE_TIME + 600)
+    record['outTemp'] = 59
+    monkeypatch.setattr(engine.console, 'genArchiveRecords',
+                        lambda since: iter([record]), raising=False)
+    feed_loop_interval(engine)
+    accumulator = archive.old_accumulator
+
+    engine.dispatchEvent(weewx.Event(weewx.POST_LOOP))
+
+    primary = engine.db_binder.get_manager('wx_binding')
+    assert primary.getRecord(BASE_TIME + 600)['outTemp'] == pytest.approx(15)
+    assert accumulator.getRecord()['outTemp'] == pytest.approx(10)
+    assert primary.getSql('SELECT min, max FROM archive_day_outTemp') \
+        == pytest.approx((0, 20))
+
+
+@pytest.mark.parametrize('archive_engine', [
+    {'StdCalibrate': {'Corrections': {'outTemp': ['outTemp + 5', 'archive']}}}
+], indirect=True)
+@pytest.mark.parametrize('generation', ['software', 'hardware'])
+def test_archive_only_calibration_preserves_loop_statistics(archive_engine, monkeypatch,
+                                                           generation):
+    engine, archive, _events = archive_engine
+    archive.record_generation = generation
+    monkeypatch.setattr(engine.console, 'genArchiveRecords',
+                        lambda since: iter([hardware_record(BASE_TIME + 600)]), raising=False)
+    feed_loop_interval(engine)
+    accumulator = archive.old_accumulator
+    original_stats = accumulator['outTemp'].getStatsTuple()
+
+    engine.dispatchEvent(weewx.Event(weewx.POST_LOOP))
+
+    primary = engine.db_binder.get_manager('wx_binding')
+    assert primary.getRecord(BASE_TIME + 600)['outTemp'] == pytest.approx(15)
+    assert accumulator.getRecord()['outTemp'] == pytest.approx(10)
+    assert accumulator['outTemp'].getStatsTuple() == original_stats
+    assert primary.getSql('SELECT min, max FROM archive_day_outTemp') \
+        == pytest.approx((0, 20))
+
+
+def test_database_batch_ignores_unrelated_loop_statistics(archive_engine):
+    engine, archive, _events = archive_engine
+    feed_loop_interval(engine)
+    secondary = engine.db_binder.get_manager('alt_binding')
+    records = [{'dateTime': timestamp, 'usUnits': weewx.METRICWX,
+                'interval': 5, 'outTemp': 10}
+               for timestamp in [BASE_TIME - 86400 + 300, BASE_TIME + 300]]
+
+    secondary.addRecord(records, accumulator=archive.old_accumulator, log_success=False)
+
+    assert list(secondary.genSql('SELECT min, max FROM archive_day_outTemp ORDER BY dateTime')) \
+        == [(10, 10), (10, 10)]
