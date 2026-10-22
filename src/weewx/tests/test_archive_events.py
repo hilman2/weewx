@@ -154,35 +154,27 @@ def test_loop_hilo_disabled_keeps_statistics_unavailable(archive_engine):
     assert accumulator['outTemp'].avg == pytest.approx(10)
 
 
-@pytest.mark.parametrize('has_accumulator_attribute', [False, True])
 @pytest.mark.parametrize('offset', [300, 600])
 @pytest.mark.parametrize('augmentation', [True, False])
-def test_legacy_archive_events_preserve_optional_accumulator(archive_engine,
-                                                            has_accumulator_attribute,
-                                                            offset, augmentation):
+def test_archive_event_with_no_accumulator_has_no_loop_statistics(archive_engine,
+                                                                 offset, augmentation):
     engine, archive, _events = archive_engine
     archive.record_augmentation = augmentation
     feed_loop_interval(engine)
     timestamp = BASE_TIME + offset
     record = hardware_record(timestamp)
     del record['inTemp']
-    event = weewx.Event(weewx.NEW_ARCHIVE_RECORD, record=record, origin='hardware')
-    if has_accumulator_attribute:
-        event.accumulator = None
+    event = weewx.Event(weewx.NEW_ARCHIVE_RECORD, record=record, origin='hardware',
+                       accumulator=None)
 
     engine.dispatchEvent(event)
 
     primary = engine.db_binder.get_manager('wx_binding')
     saved_record = primary.getRecord(timestamp)
-    uses_loop_statistics = not has_accumulator_attribute and offset == 600
-    expected_extremes = (0, 20) if uses_loop_statistics else (10, 10)
     assert primary.getSql('SELECT min, max FROM archive_day_outTemp') \
-        == pytest.approx(expected_extremes)
+        == pytest.approx((10, 10))
     assert saved_record['outTemp'] == pytest.approx(10)
-    if uses_loop_statistics and augmentation:
-        assert saved_record['inTemp'] == pytest.approx(21)
-    else:
-        assert saved_record['inTemp'] is None
+    assert saved_record['inTemp'] is None
 
 
 def test_hardware_archive_preserves_console_average(archive_engine, monkeypatch):
@@ -221,7 +213,9 @@ def test_archive_only_calibration_preserves_loop_statistics(archive_engine, monk
     engine.dispatchEvent(weewx.Event(weewx.POST_LOOP))
 
     primary = engine.db_binder.get_manager('wx_binding')
-    assert primary.getRecord(BASE_TIME + 600)['outTemp'] == pytest.approx(15)
+    saved_record = primary.getRecord(BASE_TIME + 600)
+    assert saved_record['dateTime'] == accumulator.timespan.stop
+    assert saved_record['outTemp'] == pytest.approx(15)
     assert accumulator.getRecord()['outTemp'] == pytest.approx(10)
     assert accumulator['outTemp'].getStatsTuple() == original_stats
     assert primary.getSql('SELECT min, max FROM archive_day_outTemp') \

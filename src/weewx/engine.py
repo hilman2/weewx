@@ -690,32 +690,22 @@ class StdArchive(StdService):
         """Save an archive record and its available LOOP statistics.
 
         Args:
-            event (weewx.Event): The archive record, its origin, and an optional
-                accumulator. Events without an accumulator attribute use the
-                completed LOOP accumulator if its ending timestamp matches.
+            event (weewx.Event): An archive event with record, origin, and accumulator
+                attributes. The accumulator is None when no matching LOOP data is available.
         """
-
-        # An explicit None means no accumulator is available. Only older event
-        # producers that omit the attribute use the service's completed accumulator.
-        if hasattr(event, 'accumulator'):
-            accumulator = event.accumulator
-        else:
-            accumulator = self.old_accumulator
-            if accumulator and event.record['dateTime'] != accumulator.timespan.stop:
-                accumulator = None
 
         # If requested, extract any extra information we can out of the 
         # accumulator and put it in the record. Not necessary in the case 
         # of software record generation because it has already been done.
         if self.record_augmentation \
-                and accumulator \
+                and event.accumulator \
                 and event.origin != 'software':
-            accumulator.augmentRecord(event.record)
+            event.accumulator.augmentRecord(event.record)
 
         # Save the record to the database
         dbmanager = self.engine.db_binder.get_manager(self.data_binding)
         dbmanager.addRecord(event.record,
-                            accumulator=accumulator,
+                            accumulator=event.accumulator,
                             log_success=self.log_success,
                             log_failure=self.log_failure)
 
